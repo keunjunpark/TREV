@@ -15,7 +15,7 @@ from ..measure.correct_sampling import argmax_bitstring_tr_right_suffix
 import cProfile
 import time, gc, torch
 from TRVQA.optimization.gradients.gradient import MeasureMethod
-#
+
 def minimize(
     circuit: Circuit,
     theta: torch.Tensor,
@@ -100,38 +100,6 @@ def minimize(
                     break
 
         return theta, exp_values, best_result, iteration_times
-
-
-def minimize_custom(circuit:Circuit, theta:torch.Tensor, hamiltonian:Hamiltonian, optimizer:Optimizer, gradient:Gradient, iteration:int):
-    with torch.no_grad():
-        theta = theta.clone().to(circuit.device)
-        optim = optimizer.get_optimizer([theta])
-        lr = optimizer.args['lr']
-        exp_values = []
-        best_result = []
-        iteration_times = []
-        start = time.time()
-        for epoch in range(iteration):
-            it_time = time.time()
-            optim.zero_grad()
-            grad = gradient.run(theta,circuit,hamiltonian)
-            theta.grad = grad
-            optim.step()
-            #print('prev', theta)
-            # theta = theta - lr * grad
-            # print("manual: theta - lr * grads")
-            # print('after', theta)
-            #print('diff', lr*grad)
-            torch.cuda.synchronize()
-            iteration_times.append(time.time()-it_time)
-            exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
-            exp_values.append(exp_value)
-            best_result.append(argmax_bitstring_tr_right_suffix(circuit.build_tensor(theta)))
-            progress_bar(epoch, iteration, start, exp_value)
-            if epoch % 10 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
-        return theta,exp_values,best_result, iteration_times
 
 def progress_bar(current, total, start_time, loss=None, bar_len=30):
     percent = float(current) / total
