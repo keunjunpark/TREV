@@ -1,0 +1,16 @@
+run_id,method,N,depth,seed,theta_path,iter_csv
+99a00b96,tr_efficient,4,3,0,maxcut_comparison_GPU/theta_99a00b96.pt,maxcut_comparison_GPU/iter_99a00b96.csv
+0d41cb87,tr_correct_sampling,4,3,0,maxcut_comparison_GPU/theta_0d41cb87.pt,maxcut_comparison_GPU/iter_0d41cb87.csv
+01d03640,tr_sampling,4,3,0,maxcut_comparison_GPU/theta_01d03640.pt,maxcut_comparison_GPU/iter_01d03640.csv
+a6f837a9,tr_efficient,8,3,0,maxcut_comparison_GPU/theta_a6f837a9.pt,maxcut_comparison_GPU/iter_a6f837a9.csv
+25ac85d2,tr_correct_sampling,8,3,0,maxcut_comparison_GPU/theta_25ac85d2.pt,maxcut_comparison_GPU/iter_25ac85d2.csv
+abc59f7d,tr_sampling,8,3,0,maxcut_comparison_GPU/theta_abc59f7d.pt,maxcut_comparison_GPU/iter_abc59f7d.csv
+5eff4888,tr_efficient,16,3,0,maxcut_comparison_GPU/theta_5eff4888.pt,maxcut_comparison_GPU/iter_5eff4888.csv
+ef8bf71b,tr_correct_sampling,16,3,0,maxcut_comparison_GPU/theta_ef8bf71b.pt,maxcut_comparison_GPU/iter_ef8bf71b.csv
+d9d117aa,tr_sampling,16,3,0,maxcut_comparison_GPU/theta_d9d117aa.pt,maxcut_comparison_GPU/iter_d9d117aa.csv
+bb948366,tr_efficient,24,3,0,maxcut_comparison_GPU/theta_bb948366.pt,maxcut_comparison_GPU/iter_bb948366.csv
+4cd57f34,tr_correct_sampling,24,3,0,maxcut_comparison_GPU/theta_4cd57f34.pt,maxcut_comparison_GPU/iter_4cd57f34.csv
+8229db15,tr_sampling,24,3,0,maxcut_comparison_GPU/theta_8229db15.pt,maxcut_comparison_GPU/iter_8229db15.csv
+bcc5b403,sv,4,3,0,maxcut_comparison_GPU/theta_bcc5b403.pt,maxcut_comparison_GPU/iter_bcc5b403.csv
+bfe5c571,sv,8,3,0,maxcut_comparison_GPU/theta_bfe5c571.pt,maxcut_comparison_GPU/iter_bfe5c571.csv
+e3fd1a2c,sv,16,3,0,maxcut_comparison_GPU/theta_e3fd1a2c.pt,maxcut_comparison_GPU/iter_e3fd1a2c.csv
