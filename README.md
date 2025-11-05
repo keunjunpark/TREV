@@ -1,4 +1,4 @@
-# TREV: Tensor Ring Enhanced Variational Quantum Computing Framework
+# TREV: Python Library for Efficient Implementations of Variational Quantum Algorithms for Optimization using Tensor Networks
 
 TREV is a high-performance quantum computing simulation framework implemented in PyTorch, designed for variational quantum algorithms using tensor ring (periodic Matrix Product State) representations. The framework provides multiple measurement strategies and optimization methods for quantum circuit simulation.
 
