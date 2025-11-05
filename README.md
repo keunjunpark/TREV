@@ -108,8 +108,7 @@ result = minimize(
     hamiltonian=hamiltonian,
     optimizer=optimizer,
     gradient=gradient,
-    iteration=100,
-    best_value_method='full_contraction'
+    iteration=100
 )
 ```
 
@@ -126,20 +125,20 @@ The main class for building and simulating quantum circuits:
 #### Measurement Methods
 
 1. **Contraction** (`MeasureMethod.CONTRACTION`)
-   - Exact tensor contraction for small systems
+   - Full tensor contraction for small systems
    - Provides exact results but scales exponentially
 
 2. **Sampling** (`MeasureMethod.SAMPLING`)
-   - Monte Carlo sampling from quantum state
-   - Scalable but provides statistical estimates
+   - Perfect sampling from quantum state
+   - Scalable sampling method for large systems
 
 3. **Efficient Contraction** (`MeasureMethod.EFFICIENT_CONTRACTION`)
-   - Optimized batched contraction method
-   - Balance between accuracy and efficiency
+   - Partial tensor contraction method
+   - Balance between accuracy and efficiency without full contraction
 
 4. **Correct Sampling** (`MeasureMethod.CORRECT_SAMPLING`)
-   - Advanced sampling with error correction
-   - High accuracy with controlled statistical errors
+   - Right suffix sampling method
+   - Advanced sampling with proper suffix boundary handling
 
 #### Hamiltonian Support
 - **Pauli Strings**: Support for arbitrary Pauli string operators
