@@ -159,9 +159,9 @@ TREV/
 │   └── hamiltonian.py    # Hamiltonian class
 ├── measure/               # Measurement methods
 │   ├── contraction.py    # Tensor contraction
-│   ├── sampling.py       # Monte Carlo sampling
+│   ├── sampling.py       # Perfect sampling
 │   ├── efficient_contraction.py # Efficient methods
-│   ├── correct_sampling.py # Advanced sampling
+│   ├── correct_sampling.py # Right Suffix sampling
 │   └── enums.py         # Method enumerations
 ├── optimization/         # Optimization algorithms
 │   ├── optimization.py  # Main optimization routines
@@ -261,11 +261,6 @@ TREV is optimized for high-performance quantum simulation:
 - **Memory Efficiency**: Tensor ring representation reduces memory footprint
 - **Parallel Processing**: Batch operations for multiple parameter sets
 - **Scalable Algorithms**: Multiple measurement methods for different system sizes
-
-### Recommended Usage:
-- **Small systems (≤12 qubits)**: Use `CONTRACTION` for exact results
-- **Medium systems (12-20 qubits)**: Use `EFFICIENT_CONTRACTION` 
-- **Large systems (>20 qubits)**: Use `SAMPLING` or `CORRECT_SAMPLING`
 
 ## Contributing
 
