@@ -1,5 +1,10 @@
 # TREV: Python Library for Efficient Implementations of Variational Quantum Algorithms for Optimization using Tensor Networks
 
+[![Tests](https://github.com/keunjunpark/TREV/actions/workflows/test.yml/badge.svg)](https://github.com/keunjunpark/TREV/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/keunjunpark/TREV/branch/main/graph/badge.svg)](https://codecov.io/gh/keunjunpark/TREV)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 TREV is a high-performance quantum computing simulation framework implemented in PyTorch, designed for variational quantum algorithms using tensor ring (periodic Matrix Product State) representations. The framework provides multiple measurement strategies and optimization methods for quantum circuit simulation.
 
 ## Features
