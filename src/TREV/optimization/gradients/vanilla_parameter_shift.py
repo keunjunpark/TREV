@@ -19,6 +19,6 @@ def vanilla_parameter_shift(
         params_backward = params.clone().to(circuit.device)
         params_forward[i] += shift
         params_backward[i] -= shift
-        gradients[i] = (circuit.get_expectation_value(params_forward, hamiltonian, MeasureMethod.SAMPLING, int(shots)) -
-                        circuit.get_expectation_value(params_backward, hamiltonian, MeasureMethod.SAMPLING, int(shots))) / 2
+        gradients[i] = (circuit.get_expectation_value(params_forward, hamiltonian, MeasureMethod.PERFECT_SAMPLING, int(shots)) -
+                        circuit.get_expectation_value(params_backward, hamiltonian, MeasureMethod.PERFECT_SAMPLING, int(shots))) / 2
     return gradients

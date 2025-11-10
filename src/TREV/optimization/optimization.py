@@ -11,7 +11,7 @@ from ..measure.contraction import get_value_of_highest_probability, argmax_tr_no
 from ..measure.enums import MeasureMethod
 from ..optimization.gradients.gradient import Gradient
 from ..optimization.optimizer import Optimizer
-from ..measure.correct_sampling import argmax_bitstring_tr_right_suffix
+from ..measure.right_suffix_sampling import argmax_bitstring_tr_right_suffix
 import cProfile
 import time, gc, torch
 from TREV.optimization.gradients.gradient import MeasureMethod
@@ -71,15 +71,15 @@ def minimize(
                 best_bitstring = format(best_idx, f'0{num_qubits}b')
                 best_result.append(best_bitstring[::-1])
             else:
-                if gradient.measure_method in [MeasureMethod.SAMPLING]:
+                if gradient.measure_method in [MeasureMethod.PERFECT_SAMPLING]:
                     best_result.append(
                         get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
                     )
-                elif gradient.measure_method in [MeasureMethod.CONTRACTION, MeasureMethod.EFFICIENT_CONTRACTION]:
+                elif gradient.measure_method in [MeasureMethod.FULL_CONTRACTION, MeasureMethod.EFFICIENT_CONTRACTION]:
                     best_result.append(
                         argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
                     )
-                elif gradient.measure_method in [MeasureMethod.CORRECT_SAMPLING]:
+                elif gradient.measure_method in [MeasureMethod.RIGHT_SUFFIX_SAMPLING]:
                     best_result.append(
                         argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
                     )

@@ -11,7 +11,7 @@ from .gates.parameter_gates import ParameterOneQubitGate, ParameterGate
 from .gates.info import I, H,X,Y,Z, RX, RY, RZ, CNOT, SWAP
 from .hamiltonian.hamiltonian import Hamiltonian
 from .measure.enums import MeasureMethod
-from .measure import contraction, sampling, efficient_contraction, correct_sampling
+from .measure import contraction, perfect_sampling, efficient_contraction, right_suffix_sampling
 class Circuit(torch.nn.Module):
     def __init__(self, num_qubit:int, rank:int=10, device:str='cpu'):
         super().__init__()
@@ -78,25 +78,25 @@ class Circuit(torch.nn.Module):
                 np_gate.apply_batch(batch_size, tensor)
         return tensor
 
-    def measure(self, theta: Tensor, method:MeasureMethod=MeasureMethod.SAMPLING, shots:int= int(1e4)):
+    def measure(self, theta: Tensor, method:MeasureMethod=MeasureMethod.PERFECT_SAMPLING, shots:int= int(1e4)):
         tensor = self.build_tensor(theta)
-        if method == MeasureMethod.CONTRACTION:
+        if method == MeasureMethod.FULL_CONTRACTION:
             return contraction.measure(tensor)
-        elif method == MeasureMethod.SAMPLING:
-            return sampling.measure(tensor,shots,device=self.device)
+        elif method == MeasureMethod.PERFECT_SAMPLING:
+            return perfect_sampling.measure(tensor,shots,device=self.device)
         else:
             raise NotImplementedError()
 
     def get_expectation_value(self, theta: Tensor, hamiltonian:Hamiltonian, method: MeasureMethod, shots:int= int(1e4)):
         tensor = self.build_tensor(theta)
-        if method == MeasureMethod.CONTRACTION:
+        if method == MeasureMethod.FULL_CONTRACTION:
             return contraction.expectation_value(tensor,hamiltonian, device=self.device).real
-        elif method == MeasureMethod.SAMPLING:
-            return sampling.expectation_value(tensor,hamiltonian,device=self.device, shot=shots)
+        elif method == MeasureMethod.PERFECT_SAMPLING:
+            return perfect_sampling.expectation_value(tensor,hamiltonian,device=self.device, shot=shots)
         elif method == MeasureMethod.EFFICIENT_CONTRACTION:
             # return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device, chunk_size=shots)
             return efficient_contraction.expectation_value(tensor,hamiltonian,device=self.device)
-        elif method == MeasureMethod.CORRECT_SAMPLING:
-            return correct_sampling.expectation_value(tensor,hamiltonian,shots=shots, chunk_size=shots)
+        elif method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
+            return right_suffix_sampling.expectation_value(tensor,hamiltonian,shots=shots, chunk_size=shots)
         else:
             raise NotImplementedError()

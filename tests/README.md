@@ -48,10 +48,10 @@ tests/
 - CUDA support
 
 ### test_measurement.py
-- Sampling measurement
-- Contraction measurement
+- Perfect Sampling measurement
+- Full contraction measurement
 - Efficient contraction method
-- Correct sampling method
+- Right suffix sampling method
 - Expectation value calculations
 - Consistency across methods
 - Edge cases and numerical stability

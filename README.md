@@ -83,11 +83,11 @@ hamiltonian.add_pauli('IZZI', 0.5)  # I⊗Z⊗Z⊗I with coefficient 0.5
 ```python
 # Calculate expectation value using different methods
 exp_val_contraction = circuit.get_expectation_value(
-    theta, hamiltonian, MeasureMethod.CONTRACTION
+    theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
 )
 
 exp_val_sampling = circuit.get_expectation_value(
-    theta, hamiltonian, MeasureMethod.SAMPLING, shots=10000
+    theta, hamiltonian, MeasureMethod.PERFECT_SAMPLING, shots=10000
 )
 
 exp_val_efficient = circuit.get_expectation_value(
@@ -129,11 +129,11 @@ The main class for building and simulating quantum circuits:
 
 #### Measurement Methods
 
-1. **Contraction** (`MeasureMethod.CONTRACTION`)
+1. **Full Contraction** (`MeasureMethod.FULL_CONTRACTION`)
    - Full tensor contraction for small systems
    - Provides exact results but scales exponentially
 
-2. **Sampling** (`MeasureMethod.SAMPLING`)
+2. **Perfect Sampling** (`MeasureMethod.PERFECT_SAMPLING`)
    - Perfect sampling from quantum state
    - Scalable sampling method for large systems
 
@@ -141,7 +141,7 @@ The main class for building and simulating quantum circuits:
    - Partial tensor contraction method
    - Balance between accuracy and efficiency without full contraction
 
-4. **Correct Sampling** (`MeasureMethod.CORRECT_SAMPLING`)
+4. **Correct Perfect Sampling** (`MeasureMethod.CORRECT_PERFECT_SAMPLING`)
    - Right suffix sampling method
    - Advanced sampling with proper suffix boundary handling
 

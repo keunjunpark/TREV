@@ -8,16 +8,16 @@ from TREV.hamiltonian.hamiltonian import Hamiltonian
 from TREV.measure.enums import MeasureMethod
 
 
-class TestSamplingMeasurement:
-    """Test sampling measurement method."""
+class TestPerfectSamplingMeasurement:
+    """Test perfect sampling measurement method."""
     
     def test_sampling_simple_circuit(self):
-        """Test sampling measurement on simple circuit."""
+        """Test perfect sampling measurement on simple circuit."""
         circuit = Circuit(num_qubit=2, rank=10, device='cpu')
         circuit.h(0)  # Create superposition on qubit 0
         
         theta = torch.tensor([])
-        counts = circuit.measure(theta, method=MeasureMethod.SAMPLING, shots=1000)
+        counts = circuit.measure(theta, method=MeasureMethod.PERFECT_SAMPLING, shots=1000)
         
         # Check that result is a dictionary
         assert isinstance(counts, (dict, list))
@@ -33,7 +33,7 @@ class TestSamplingMeasurement:
         # Don't apply any gates - should be |00>
         
         theta = torch.tensor([])
-        result = circuit.measure(theta, method=MeasureMethod.SAMPLING, shots=1000)
+        result = circuit.measure(theta, method=MeasureMethod.PERFECT_SAMPLING, shots=1000)
         
         # Result should be deterministic (all 0s)
         assert result is not None
@@ -47,35 +47,35 @@ class TestSamplingMeasurement:
         theta = torch.tensor([])
         
         for shots in [100, 1000, 10000]:
-            result = circuit.measure(theta, method=MeasureMethod.SAMPLING, shots=shots)
+            result = circuit.measure(theta, method=MeasureMethod.PERFECT_SAMPLING, shots=shots)
             assert result is not None
 
 
-class TestContractionMeasurement:
-    """Test contraction measurement method."""
+class TestFullContractionMeasurement:
+    """Test full contraction measurement method."""
     
     def test_contraction_simple_circuit(self):
-        """Test contraction measurement on simple circuit."""
+        """Test full contraction measurement on simple circuit."""
         circuit = Circuit(num_qubit=2, rank=10, device='cpu')
         circuit.h(0)
         
         theta = torch.tensor([])
-        result = circuit.measure(theta, method=MeasureMethod.CONTRACTION)
+        result = circuit.measure(theta, method=MeasureMethod.FULL_CONTRACTION)
         
         assert result is not None
     
     def test_contraction_ground_state(self):
-        """Test contraction measurement on ground state."""
+        """Test full contraction measurement on ground state."""
         circuit = Circuit(num_qubit=2, rank=10, device='cpu')
         # No gates - ground state |00>
         
         theta = torch.tensor([])
-        result = circuit.measure(theta, method=MeasureMethod.CONTRACTION)
+        result = circuit.measure(theta, method=MeasureMethod.FULL_CONTRACTION)
         
         assert result is not None
 
 
-class TestExpectationValueContraction:
+class TestExpectationValueFullContraction:
     """Test expectation value calculation with contraction method."""
     
     def test_expectation_value_identity(self):
@@ -88,7 +88,7 @@ class TestExpectationValueContraction:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # Expectation value of identity should be 1
@@ -104,7 +104,7 @@ class TestExpectationValueContraction:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # |0> is +1 eigenstate of Z
@@ -120,7 +120,7 @@ class TestExpectationValueContraction:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # <+|Z|+> = 0
@@ -136,7 +136,7 @@ class TestExpectationValueContraction:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # Both qubits in |0>, so expect 1 + 1 = 2
@@ -153,7 +153,7 @@ class TestExpectationValueContraction:
         # RX(pi) flips |0> to |1>
         theta = torch.tensor([np.pi])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # After RX(pi), expect -1
@@ -170,14 +170,14 @@ class TestExpectationValueContraction:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # Bell state has ZZ expectation value of 1
         assert np.isclose(float(exp_val), 1.0, atol=1e-5)
 
 
-class TestExpectationValueSampling:
+class TestExpectationValuePerfectSampling:
     """Test expectation value calculation with sampling method."""
     
     def test_sampling_expectation_value_identity(self):
@@ -190,7 +190,7 @@ class TestExpectationValueSampling:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.SAMPLING, shots=10000
+            theta, hamiltonian, MeasureMethod.PERFECT_SAMPLING, shots=10000
         )
         
         # Should be close to 1 with high shot count
@@ -208,12 +208,12 @@ class TestExpectationValueSampling:
         
         # Get reference value with contraction
         exact = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # Sample with increasing shots
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CORRECT_SAMPLING, shots=10000
+            theta, hamiltonian, MeasureMethod.RIGHT_SUFFIX_SAMPLING, shots=10000
         )
         print(exp_val, exact)
         # Should be reasonably close
@@ -252,7 +252,7 @@ class TestExpectationValueEfficientContraction:
         theta = torch.randn(circuit.params_size)
         # Get both methods
         exp_val_exact = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         exp_val_efficient = circuit.get_expectation_value(
             theta, hamiltonian, MeasureMethod.EFFICIENT_CONTRACTION, shots=10000
@@ -262,11 +262,11 @@ class TestExpectationValueEfficientContraction:
         assert np.isclose(float(exp_val_exact), float(exp_val_efficient), atol=0.1)
 
 
-class TestExpectationValueCorrectSampling:
-    """Test expectation value with correct sampling method."""
+class TestExpectationValueRightSuffixSampling:
+    """Test expectation value with right suffix sampling method."""
     
     def test_correct_sampling_simple(self):
-        """Test correct sampling on simple circuit."""
+        """Test right suffix sampling on simple circuit."""
         circuit = Circuit(num_qubit=3, rank=10, device='cpu')
         circuit.h(0)
         
@@ -275,7 +275,7 @@ class TestExpectationValueCorrectSampling:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CORRECT_SAMPLING, shots=1000
+            theta, hamiltonian, MeasureMethod.RIGHT_SUFFIX_SAMPLING, shots=1000
         )
         
         assert isinstance(exp_val, (float, torch.Tensor))
@@ -297,11 +297,11 @@ class TestMeasurementConsistency:
         
         # Get expectation value with different methods
         exp_val_contraction = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         exp_val_sampling = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.SAMPLING, shots=10000
+            theta, hamiltonian, MeasureMethod.PERFECT_SAMPLING, shots=10000
         )
         
         # Should be close (identity operator)
@@ -322,7 +322,7 @@ class TestMeasurementEdgeCases:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert np.isclose(float(exp_val.real), 0.0, atol=1e-5)
@@ -337,7 +337,7 @@ class TestMeasurementEdgeCases:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert np.isclose(float(exp_val), 0.0, atol=1e-5)
@@ -351,7 +351,7 @@ class TestMeasurementEdgeCases:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # |00> state, Z gives +1, coefficient is -1
@@ -372,7 +372,7 @@ class TestMeasurementNumericalStability:
         
         theta = torch.tensor([1e-6, 1e-6])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert not np.isnan(float(exp_val))
@@ -388,7 +388,7 @@ class TestMeasurementNumericalStability:
         
         theta = torch.tensor([100 * np.pi])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert not np.isnan(float(exp_val))
@@ -400,7 +400,7 @@ class TestMeasurementCUDA:
     """Test measurement methods on CUDA device."""
     
     def test_contraction_cuda(self):
-        """Test contraction measurement on CUDA."""
+        """Test full contraction measurement on CUDA."""
         circuit = Circuit(num_qubit=2, rank=10, device='cuda')
         circuit.h(0)
         
@@ -409,13 +409,13 @@ class TestMeasurementCUDA:
         
         theta = torch.tensor([], device='cuda')
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert not np.isnan(float(exp_val))
     
     def test_sampling_cuda(self):
-        """Test sampling measurement on CUDA."""
+        """Test perfect sampling measurement on CUDA."""
         circuit = Circuit(num_qubit=2, rank=10, device='cuda')
         circuit.h(0)
         
@@ -424,7 +424,7 @@ class TestMeasurementCUDA:
         
         theta = torch.tensor([], device='cuda')
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.SAMPLING, shots=1000
+            theta, hamiltonian, MeasureMethod.PERFECT_SAMPLING, shots=1000
         )
         
         assert not np.isnan(float(exp_val.real))

@@ -74,7 +74,7 @@ def batch_gradient(
             batch = torch.cat([plus, minus], dim=0).to(device)  # (2C,P)
             if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
                 exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-            elif measure_method == MeasureMethod.CORRECT_SAMPLING:
+            elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
                 exp_vals = expectation_value_batch_right_suffix(batch, circuit, hamiltonian, shots)
             else:
                 exp_vals = expectation_value_batch(batch, circuit, hamiltonian, shots)
@@ -94,7 +94,7 @@ def batch_gradient(
 
                 if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
                     exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-                elif measure_method == MeasureMethod.CORRECT_SAMPLING:
+                elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
                     
                     exp_vals = expectation_value_batch_right_suffix(batch, circuit, hamiltonian, shots)
                 else:

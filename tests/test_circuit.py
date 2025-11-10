@@ -174,7 +174,7 @@ class TestMeasurement:
         circuit.h(0)
         
         theta = torch.tensor([])
-        prob_dist = circuit.measure(theta, method=MeasureMethod.SAMPLING, shots=1000)
+        prob_dist = circuit.measure(theta, method=MeasureMethod.PERFECT_SAMPLING, shots=1000)
 
         # Results should be a probability distribution
         assert isinstance(prob_dist, list)
@@ -186,7 +186,7 @@ class TestMeasurement:
         circuit.h(0)
         
         theta = torch.tensor([])
-        result = circuit.measure(theta, method=MeasureMethod.CONTRACTION)
+        result = circuit.measure(theta, method=MeasureMethod.FULL_CONTRACTION)
         
         assert result is not None
 
@@ -204,7 +204,7 @@ class TestExpectationValue:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert isinstance(exp_val, (float, torch.Tensor))
@@ -221,7 +221,7 @@ class TestExpectationValue:
         
         theta = torch.randn(circuit.params_size)
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert isinstance(exp_val, (float, torch.Tensor))
@@ -238,7 +238,7 @@ class TestExpectationValue:
         
         theta = torch.tensor([])
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.SAMPLING, shots=10000
+            theta, hamiltonian, MeasureMethod.PERFECT_SAMPLING, shots=10000
         )
         
         assert isinstance(exp_val, (complex, torch.Tensor))
@@ -329,7 +329,7 @@ class TestGradients:
         
         theta = torch.randn(circuit.params_size, requires_grad=True)
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         # Check that we can compute gradients
@@ -369,7 +369,7 @@ class TestCUDASupport:
         
         theta = torch.randn(circuit.params_size, device='cuda')
         exp_val = circuit.get_expectation_value(
-            theta, hamiltonian, MeasureMethod.CONTRACTION
+            theta, hamiltonian, MeasureMethod.FULL_CONTRACTION
         )
         
         assert not np.isnan(float(exp_val))
