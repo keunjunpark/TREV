@@ -7,14 +7,14 @@ import time
 import gc
 from ..circuit import Circuit
 from ..hamiltonian.hamiltonian import Hamiltonian
-from ..measure.contraction import get_value_of_highest_probability, argmax_tr_noinv_LE, contract_tensor_ring
+from ..measure.contraction import get_value_of_highest_probability, argmax_tr_noinv_BE, contract_tensor_ring
 from ..measure.enums import MeasureMethod
 from ..optimization.gradients.gradient import Gradient
 from ..optimization.optimizer import Optimizer
 from ..measure.correct_sampling import argmax_bitstring_tr_right_suffix
 import cProfile
 import time, gc, torch
-from TRVQA.optimization.gradients.gradient import MeasureMethod
+from TREV.optimization.gradients.gradient import MeasureMethod
 
 def minimize(
     circuit: Circuit,
@@ -61,7 +61,7 @@ def minimize(
                 best_result.append(
                     get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
                 )
-            elif best_value_method == 'argmax_tr_noinv_LE':
+            elif best_value_method == 'argmax_tr_noinv_BE':
                 best_result.append(
                     argmax_bitstring_tr_right_suffix(circuit.build_tensor(theta))
                 )
@@ -77,11 +77,11 @@ def minimize(
                     )
                 elif gradient.measure_method in [MeasureMethod.CONTRACTION, MeasureMethod.EFFICIENT_CONTRACTION]:
                     best_result.append(
-                        argmax_tr_noinv_LE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
                     )
                 elif gradient.measure_method in [MeasureMethod.CORRECT_SAMPLING]:
                     best_result.append(
-                        argmax_tr_noinv_LE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
                     )
                 else:
                     raise NotImplementedError()

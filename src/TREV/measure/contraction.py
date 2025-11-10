@@ -5,8 +5,25 @@ from ..hamiltonian.hamiltonian import Hamiltonian
 
 
 def expectation_value(tensor:Tensor, hamiltonian:Hamiltonian, device:str = None):
-    prob = torch.tensor(measure(tensor), dtype= torch.cfloat, device=device)
-    return torch.sum(prob@hamiltonian.get_density_matrix().to(device)).detach().cpu().item()
+    """
+    Compute expectation value <psi|H|psi> using full contraction.
+    
+    Args:
+        tensor: Tensor ring representation of quantum state
+        hamiltonian: Hamiltonian operator
+        device: Device for computation
+        
+    Returns:
+        Real-valued expectation value
+    """
+    prob = torch.tensor(measure(tensor), dtype=torch.cfloat, device=device)
+    density_matrix = hamiltonian.get_density_matrix().to(device)
+    print(prob)
+    print(density_matrix)
+    # prob is shape (2^N,), density_matrix is (2^N, 2^N)
+    # Expectation value: sum of prob[i] * H[i,i] (diagonal elements)
+    diagonal = torch.diag(density_matrix)
+    return torch.sum(prob * diagonal).real.detach().cpu().item()
 
 def contract_tensor_ring(psi: torch.Tensor) -> torch.Tensor:
     """
@@ -14,6 +31,13 @@ def contract_tensor_ring(psi: torch.Tensor) -> torch.Tensor:
     return: (2,)*N
     """
     N = psi.shape[0]                 # number of qubits/sites
+
+    if N == 1:
+        # Special case: single qubit tensor ring
+        # Contract left and right bonds: trace over χ dimensions
+        # psi[0] has shape (χ1, χ2, 2)
+        # Close the ring by contracting left and right bonds
+        return torch.einsum('iid->d', psi[0])  # (2,)
 
     psi_new = psi[0]                 # (χ1, χ2, 2)
 
@@ -32,13 +56,13 @@ def measure(ring_tensors: torch.Tensor) -> Tensor:
     """
     ring_tensors : (N, χ1, χ2, 2)
     returns      : (2**N,)  –– probabilities of all computational‑basis states
+    Big-endian: site 0 = MSB
     """
     N   = ring_tensors.shape[0]
     psi = contract_tensor_ring(ring_tensors)          # (2,…,2)
 
-    # reorder indices so qubit‑0 is least‑significant (optional, same as before)
-    for i in range(N - 1, 0, -1):
-        psi = psi.movedim(0, i)
+    # Big-endian ordering: site 0 is most significant bit (MSB)
+    # No reordering needed - natural tensor order
 
     prob = (psi * psi.conj()).real                    # (2,…,2)
     return prob.reshape(-1).detach().cpu().numpy()            # (2**N,)
@@ -136,10 +160,10 @@ def precompute_double_layer_and_right_suffix(cores):
     return Es, R_suf, d2, device, dtype
 
 @torch.no_grad()
-def argmax_tr_noinv_LE(cores, tie_break='random'):
+def argmax_tr_noinv_BE(cores, tie_break='random'):
     """
     Greedy highest-probability bitstring on a periodic MPS / tensor ring.
-    - little-endian (site 0 = LSB)
+    - big-endian (site 0 = MSB)
     - no solves/inverses
     - single pass using left & right environments
     - tie_break: '0', '1', or 'random'

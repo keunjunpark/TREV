@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Callable
 
 from .contraction import _apply_single_qubit_gate, _apply_single_qubit_gate_batch,_apply_double_qubit_gate
-from TRVQA.gates.gates import Gate
+from TREV.gates.gates import Gate
 class ParameterGate(ABC):
     def __init__(self, theta_index:int, device:str):
         self.theta_index = theta_index

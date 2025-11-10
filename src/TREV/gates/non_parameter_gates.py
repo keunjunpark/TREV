@@ -3,7 +3,7 @@ from typing import Callable
 
 from .contraction import _apply_single_qubit_gate, _apply_single_qubit_gate_batch, _apply_double_qubit_gate, \
     _apply_double_qubit_gate_batch
-from TRVQA.gates.gates import Gate
+from TREV.gates.gates import Gate
 
 
 class NonParameterGate(ABC):

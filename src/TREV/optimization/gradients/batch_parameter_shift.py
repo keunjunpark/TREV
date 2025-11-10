@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 from torch import Tensor, no_grad
 
-from TRVQA.measure.contraction import precompute_double_layer_and_right_suffix
+from TREV.measure.contraction import precompute_double_layer_and_right_suffix
 
 from ...circuit import Circuit
 from ...hamiltonian.hamiltonian import Hamiltonian
