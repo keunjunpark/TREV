@@ -11,10 +11,10 @@ TREV is a high-performance quantum computing simulation framework implemented in
 
 - **Tensor Ring Architecture**: Efficient quantum state representation using periodic Matrix Product States
 - **Multiple Measurement Methods**: 
-  - Direct tensor contraction
-  - Monte Carlo sampling
-  - Efficient batched contraction
-  - Corrected sampling algorithms
+  - Full Contraction
+  - Perfect Sampling
+  - Efficient Contraction
+  - Right Suffix Contraction
 - **Quantum Gates**: Support for common quantum gates (Pauli gates, rotation gates, CNOT, SWAP)
 - **Hamiltonian Operations**: Full support for Pauli string Hamiltonians
 - **Optimization**: Built-in gradient computation and optimization algorithms
@@ -23,7 +23,7 @@ TREV is a high-performance quantum computing simulation framework implemented in
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - PyTorch (with CUDA support recommended)
 - NumPy
 - Qiskit (for utility functions)
