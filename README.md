@@ -141,7 +141,7 @@ The main class for building and simulating quantum circuits:
    - Partial tensor contraction method
    - Balance between accuracy and efficiency without full contraction
 
-4. **Correct Perfect Sampling** (`MeasureMethod.CORRECT_PERFECT_SAMPLING`)
+4. **Right Suffix Sampling** (`MeasureMethod.RIGHT_SUFFIX_SAMPLING`)
    - Right suffix sampling method
    - Advanced sampling with proper suffix boundary handling
 
@@ -164,9 +164,9 @@ TREV/
 │   └── hamiltonian.py    # Hamiltonian class
 ├── measure/               # Measurement methods
 │   ├── contraction.py    # Tensor contraction
-│   ├── sampling.py       # Perfect sampling
+│   ├── perfect_sampling.py       # Perfect sampling
 │   ├── efficient_contraction.py # Efficient methods
-│   ├── correct_sampling.py # Right Suffix sampling
+│   ├── right_suffix_samping.py # Right Suffix sampling
 │   └── enums.py         # Method enumerations
 ├── optimization/         # Optimization algorithms
 │   ├── optimization.py  # Main optimization routines
