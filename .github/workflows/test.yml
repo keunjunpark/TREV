@@ -31,7 +31,7 @@ jobs:
 
     - name: Run tests with pytest
       run: |
-        pytest -v --cov=src/TREV --cov-report=xml:coverage.xml --cov-report=term-missing
+        pytest --cov --junitxml=junit.xml -o junit_family=legacy
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
