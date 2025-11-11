@@ -94,8 +94,7 @@ class Circuit(torch.nn.Module):
         elif method == MeasureMethod.PERFECT_SAMPLING:
             return perfect_sampling.expectation_value(tensor,hamiltonian,device=self.device, shot=shots)
         elif method == MeasureMethod.EFFICIENT_CONTRACTION:
-            # return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device, chunk_size=shots)
-            return efficient_contraction.expectation_value(tensor,hamiltonian,device=self.device)
+            return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device, chunk_size=shots)
         elif method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
             return right_suffix_sampling.expectation_value(tensor,hamiltonian,shots=shots, chunk_size=shots)
         else:

@@ -10,8 +10,6 @@ def E_site(core):  # core: [chi,2,chi] -> (E, (E0,E1)) in double layer
     B0, B1 = core[:,:,0], core[:,:,1]
     E0 = kron(B0, B0.conj())
     E1 = kron(B1, B1.conj())
-    # E0 = B0
-    # E1 = B1
     return (E0 + E1), (E0, E1)
 
 @torch.no_grad()
@@ -64,20 +62,6 @@ def expectation_value(
     # Cast once
     Es    = [(E0.to(cdtype), E1.to(cdtype)) for (E0,E1) in Es]
     R_suf = [Ri.to(cdtype) for Ri in R_suf]
-
-    for i in range(n):
-        print(f"site {i} rsuf")
-        print(R_suf[i])
-    
-
-    print("first rsuf")
-    print(R_suf[0])
-    print("last rsuf")
-    print(R_suf[-1])
-    # # Detect recipe
-    # orient, perms, err = detect_full_recipe(cores, Es, R_suf, trials=8)
-    # print(f"Detected single-layer sampling recipe: orient={orient}, max |Δw|={err:.2e}")
-    # print("  Suffix perms per site:", perms)
     # Prep per-site R4 with detected permutation
     R4 = [ R_suf[i].view(chi,chi,chi,chi).permute(2,3,0,1).contiguous() for i in range(n) ]
     # Single-layer slices
