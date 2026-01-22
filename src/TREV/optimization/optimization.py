@@ -48,8 +48,8 @@ def minimize(
             grad = gradient.run(theta, circuit, hamiltonian)
             theta.grad = grad
             optim.step()
-
-            torch.cuda.synchronize()
+            if circuit.device == 'cuda':
+                torch.cuda.synchronize()
             iteration_times.append(time.time() - it_time)
 
             # --- expectation value ---

@@ -124,7 +124,8 @@ def expectation_value_batch(
                 torch.cuda.manual_seed_all(seed)
 
         B = param_batch.shape[0]
-        torch.cuda.synchronize()
+        if circuit.device == 'cuda':
+            torch.cuda.synchronize()
 
         batch_coefs = (
             torch.tensor(hamiltonian.coefficients, dtype=torch.complex64, device=circuit.device)
