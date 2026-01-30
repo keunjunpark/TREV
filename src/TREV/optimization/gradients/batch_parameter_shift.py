@@ -1,6 +1,6 @@
 import time
 from typing import List, Optional
-
+import os
 # # .../measure/efficient_contraction.py
 # from __future__ import annotations
 from typing import Optional
@@ -10,24 +10,84 @@ import torch
 from torch import Tensor, no_grad
 
 from TREV.measure.contraction import precompute_double_layer_and_right_suffix
+from TREV.optimization.gradients.set_batch_size import auto_batch_size
 
 from ...circuit import Circuit
 from ...hamiltonian.hamiltonian import Hamiltonian
 from ...measure.enums import MeasureMethod
 from ...optimization.gradients.gradient import Gradient
 
+def _gpu_info(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "CPU"
+    name = torch.cuda.get_device_name(device)
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(device)
+        gb = 1024**3
+        return f"{name} (free {free_b/gb:.2f} GB / total {total_b/gb:.2f} GB)"
+    except Exception:
+        return name
 
 class BatchParameterShiftGradient(Gradient):
-    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool = False):
+    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False):
         super().__init__(measure_method)
         self.shift = shift
-        self.batch_size = batch_size
+        self.batch_size = batch_size  # may be None
         self.shots = shots
         self.depth = depth
         self.curr_depth = 0
         self.is_partial = is_partial
+        self._autotuned = False
+
+        # optional: control printing via env var
+        self._verbose = True
+
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
-        val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots, self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method)
+        if (self.batch_size is None) and (not self._autotuned):
+            device = torch.device(circuit.device) if isinstance(circuit.device, str) else circuit.device
+            P = theta.numel()
+            base = theta.detach().to(device).unsqueeze(0)
+
+            def run_batch_fn(bs: int):
+                idx = torch.arange(0, min(bs, P), device=device)
+                C = idx.numel()
+                if C == 0:
+                    return
+                plus = base.repeat(C, 1)
+                minus = plus.clone()
+                plus[torch.arange(C), idx] += self.shift
+                minus[torch.arange(C), idx] -= self.shift
+                param_batch = torch.cat([plus, minus], dim=0)
+
+                if self.measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
+                    _ = expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, self.shots)
+                elif self.measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
+                    _ = expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, self.shots)
+                else:
+                    _ = expectation_value_batch(param_batch, circuit, hamiltonian, self.shots)
+
+            self.batch_size = auto_batch_size(
+                run_batch_fn,
+                device,
+                min_bs=1,
+                max_bs=min(4096, P),
+                safety_frac=0.85,
+                warmup=1,
+                use_amp=False,
+            )
+
+            self._autotuned = True
+
+            if self._verbose:
+                print(
+                    f"[TREV] Auto batch_size selected: {self.batch_size} "
+                    f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
+                    f"\n"
+                    , flush=True
+                )
+
+        val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
+                             self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
     
