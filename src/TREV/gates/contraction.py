@@ -10,15 +10,14 @@ def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
         return torch.linalg.svd(matrix, full_matrices=False)
     
     # Check for non-finite values before SVD
-    if torch.isnan(matrix).any() or torch.isinf(matrix).any():
+    if not torch.isfinite(matrix).all():
         # Fall back to full SVD if input has non-finite values
         return torch.linalg.svd(matrix, full_matrices=False)
     
     try:
         u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
         # Check if result has non-finite values
-        if torch.isnan(u).any() or torch.isnan(s).any() or torch.isnan(v).any() or \
-           torch.isinf(u).any() or torch.isinf(s).any() or torch.isinf(v).any():
+        if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(v).all()):
             # Fall back to full SVD
             return torch.linalg.svd(matrix, full_matrices=False)
         return u, s, v.mH
