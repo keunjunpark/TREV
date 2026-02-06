@@ -61,11 +61,10 @@ class BatchParameterShiftGradient(Gradient):
                 if C == 0:
                     return
                 arange_C = torch.arange(C, device=device)
-                plus = base.repeat(C, 1)
-                minus = plus.clone()
-                plus[arange_C, idx] += self.shift
-                minus[arange_C, idx] -= self.shift
-                param_batch = torch.cat([plus, minus], dim=0)
+                # Build a (2C, P) batch without repeat/cat
+                param_batch = base.expand(2 * C, -1).clone()
+                param_batch[arange_C, idx] += self.shift
+                param_batch[C + arange_C, idx] -= self.shift
                 _dispatch_expectation(param_batch, circuit, hamiltonian, self.shots, self.measure_method)
 
             self.batch_size = auto_batch_size(
@@ -128,12 +127,9 @@ def batch_gradient(
             idx = torch.arange(start, stop, device=device)
             arange_C = torch.arange(C, device=device)
 
-            plus  = base.repeat(C, 1)       # (C, P)
-            minus = plus.clone()
-
-            plus[arange_C, idx]  += shift
-            minus[arange_C, idx] -= shift
-            batch = torch.cat([plus, minus], dim=0)  # (2C, P)
+            batch = base.expand(2 * C, -1).clone()  # (2C, P)
+            batch[arange_C, idx] += shift
+            batch[C + arange_C, idx] -= shift
 
             exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
@@ -144,12 +140,9 @@ def batch_gradient(
                 idx    = torch.arange(start, stop, device=device)
                 arange_C = torch.arange(C, device=device)
 
-                plus   = base.repeat(C, 1)       # (C, P)
-                minus  = plus.clone()
-
-                plus[arange_C, idx]  += shift
-                minus[arange_C, idx] -= shift
-                batch  = torch.cat([plus, minus], dim=0)  # (2C, P)
+                batch = base.expand(2 * C, -1).clone()  # (2C, P)
+                batch[arange_C, idx] += shift
+                batch[C + arange_C, idx] -= shift
 
                 exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
                 grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
@@ -179,62 +172,86 @@ def expectation_value_batch(
         if device == 'cuda':
             torch.cuda.synchronize()
 
-        batch_coefs = (
-            torch.tensor(hamiltonian.coefficients, dtype=torch.complex64, device=device)
-            .unsqueeze(0).unsqueeze(0).expand(B, shots, -1).clone()
-        )
-
         ring_tensor_batch = circuit.build_tensor_batch(param_batch, B)
         B, N = ring_tensor_batch.shape[:2]
         # (T, N) bool -> index as paulis[:, site_i] to get (T,) mask for that site
         paulis = hamiltonian.get_bool_pauli_tensor().to(device=device)
+        coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=torch.float64, device=device)
+        T = int(coeffs.numel())
 
         q0 = torch.tensor([[1], [0]], dtype=torch.cfloat, device=device)
         q1 = torch.tensor([[0], [1]], dtype=torch.cfloat, device=device)
 
-        batch_prev: torch.Tensor | None = None
+        shot_chunk = shots
+        totals = torch.zeros(B, dtype=torch.float64, device=device)
+        done = 0
 
-        for i in range(N):
-            curr_tens = ring_tensor_batch[:, i].contiguous()
+        for s0 in range(0, shots, shot_chunk):
+            s1 = min(s0 + shot_chunk, shots)
+            S = s1 - s0
+            if S == 0:
+                continue
 
-            if i == 0:
-                qubit_0 = torch.einsum('bijk,kl->bijl', curr_tens, q0).squeeze(-1)
-                qubit_1 = torch.einsum('bijk,kl->bijl', curr_tens, q1).squeeze(-1)
-                batch_qubit_0 = qubit_0.unsqueeze(1).expand(-1, shots, -1, -1).contiguous()
-                batch_qubit_1 = qubit_1.unsqueeze(1).expand(-1, shots, -1, -1).contiguous()
-            else:
-                contracted = torch.einsum('bsij,bjkl->bsikl', batch_prev, curr_tens)
-                batch_qubit_0 = torch.einsum('bsijk,kl->bsijl', contracted, q0).squeeze(-1).contiguous()
-                batch_qubit_1 = torch.einsum('bsijk,kl->bsijl', contracted, q1).squeeze(-1).contiguous()
+            batch_prev: torch.Tensor | None = None
+            bits = torch.empty((B, S, N), dtype=torch.bool, device=device)
 
-            # Compute probabilities safely
-            prob_0 = torch.einsum('bsij,bsij->bs', batch_qubit_0.conj(), batch_qubit_0).real
-            prob_1 = torch.einsum('bsij,bsij->bs', batch_qubit_1.conj(), batch_qubit_1).real
-            total = prob_0 + prob_1
+            for i in range(N):
+                curr_tens = ring_tensor_batch[:, i].contiguous()
 
-            zero_mask = total == 0
-            prob_0 = torch.where(zero_mask, torch.full_like(prob_0, 0.5), prob_0)
-            prob_1 = torch.where(zero_mask, torch.full_like(prob_1, 0.5), prob_1)
-            total = prob_0 + prob_1
-            p0 = prob_0 / total
+                if i == 0:
+                    qubit_0 = torch.einsum('bijk,kl->bijl', curr_tens, q0).squeeze(-1)
+                    qubit_1 = torch.einsum('bijk,kl->bijl', curr_tens, q1).squeeze(-1)
+                    batch_qubit_0 = qubit_0.unsqueeze(1).expand(-1, S, -1, -1).contiguous()
+                    batch_qubit_1 = qubit_1.unsqueeze(1).expand(-1, S, -1, -1).contiguous()
+                else:
+                    contracted = torch.einsum('bsij,bjkl->bsikl', batch_prev, curr_tens)
+                    batch_qubit_0 = torch.einsum('bsijk,kl->bsijl', contracted, q0).squeeze(-1).contiguous()
+                    batch_qubit_1 = torch.einsum('bsijk,kl->bsijl', contracted, q1).squeeze(-1).contiguous()
 
-            # Deterministic sampling if seed given
-            rnd = torch.rand(B, shots, device=device)
-            choose_1 = rnd > p0
+                # Compute probabilities safely
+                prob_0 = torch.einsum('bsij,bsij->bs', batch_qubit_0.conj(), batch_qubit_0).real
+                prob_1 = torch.einsum('bsij,bsij->bs', batch_qubit_1.conj(), batch_qubit_1).real
+                total = prob_0 + prob_1
 
-            batch_prev = torch.where(
-                choose_1.unsqueeze(-1).unsqueeze(-1),
-                batch_qubit_1,
-                batch_qubit_0
-            )
+                zero_mask = total == 0
+                prob_0 = torch.where(zero_mask, torch.full_like(prob_0, 0.5), prob_0)
+                prob_1 = torch.where(zero_mask, torch.full_like(prob_1, 0.5), prob_1)
+                total = prob_0 + prob_1
+                p0 = prob_0 / total
 
-            # paulis[:, i] is (T,) bool: which terms have Z on site i
-            mask = paulis[:, i].unsqueeze(0).unsqueeze(1).expand(B, shots, -1)
-            flip_mask = mask & choose_1.unsqueeze(-1)
-            batch_coefs = torch.where(flip_mask, -batch_coefs, batch_coefs)
+                # Deterministic sampling if seed given
+                rnd = torch.rand(B, S, device=device)
+                choose_1 = rnd > p0
+                bits[:, :, i] = choose_1
 
-        expectations = batch_coefs.sum(dim=2).mean(dim=1)
-        return expectations.detach().real.float()
+                batch_prev = torch.where(
+                    choose_1.unsqueeze(-1).unsqueeze(-1),
+                    batch_qubit_1,
+                    batch_qubit_0
+                )
+
+            # Compute energies for this shot chunk without storing (B,S,T)
+            bf = bits.to(torch.float32).reshape(B * S, N)
+            Eb = torch.zeros((B * S,), dtype=torch.float64, device=device)
+
+            term_chunk = 4096
+            for t0 in range(0, T, term_chunk):
+                t1 = min(t0 + term_chunk, T)
+                Zblk = paulis[t0:t1, :]
+                Cblk = coeffs[t0:t1]
+                cnt = bf @ Zblk.to(torch.float32).T
+                parity = (cnt.remainder_(2.0) > 0.5)
+                sgn = torch.where(parity, -1.0, 1.0)
+                Eb += (sgn * Cblk.view(1, -1)).sum(dim=1)
+
+            totals += Eb.view(B, S).sum(dim=1)
+            done += S
+
+        if done == 0:
+            return torch.zeros((B,), dtype=torch.float32, device=device)
+
+        expectations = (totals / done).float()
+        return expectations.detach()
 
 
 
