@@ -2,6 +2,15 @@ from typing import Tuple
 import torch
 from torch import Tensor
 
+def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
+    m, n = matrix.shape
+    k = min(rank, m, n)
+    if k == min(m, n):
+        return torch.linalg.svd(matrix, full_matrices=False)
+    u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
+    return u, s, v.mH
+
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
     qu_state_tensor_batch = qu_state_tensor_batch.permute(0, 2, 3, 1)  # (B, χ1, χ2, 2)
@@ -44,7 +53,10 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     mps = torch.moveaxis(mps, 1, 2).reshape((chi_1 * 2, chi_3 * 2))
     # mps: 2 × χ1 × 2 × χ3 --> (2 * χ1) × (2 * χ3)
 
-    u, s, v = torch.linalg.svd(mps)
+    if chi_1 != chi_3:
+        u, s, v = torch.linalg.svd(mps)
+    else:
+        u, s, v = _truncated_svd(mps, chi_1)
     # u: (2 * χ1) × (2 * χ1)
     # s: 2 * min(χ1,χ3)
     # y: (2 * χ3) × (2 * χ3)
@@ -103,7 +115,20 @@ def  _apply_double_qubit_gate_batch(
 
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
-    u, s, vh = torch.linalg.svd(mps, full_matrices=False)   # u: (B, 2χ1, r),  vh: (B, r, 2χ3)
+    if chi1 != chi3:
+        u, s, vh = torch.linalg.svd(mps)   # u: (B, 2χ1, 2χ1),  vh: (B, 2χ3, 2χ3)
+    else:
+        u_list = []
+        s_list = []
+        vh_list = []
+        for b in range(B):
+            ub, sb, vhb = _truncated_svd(mps[b], chi1)
+            u_list.append(ub)
+            s_list.append(sb)
+            vh_list.append(vhb)
+        u = torch.stack(u_list, dim=0)
+        s = torch.stack(s_list, dim=0)
+        vh = torch.stack(vh_list, dim=0)
 
     # Keep the same number of singular vectors you did in the scalar path
     x  = u[:, :, :chi1]                                     # (B, 2χ1, χ1)
