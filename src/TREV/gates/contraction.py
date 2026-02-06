@@ -8,8 +8,23 @@ def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
     k = min(rank, m, n)
     if k == min(m, n):
         return torch.linalg.svd(matrix, full_matrices=False)
-    u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
-    return u, s, v.mH
+    
+    # Check for non-finite values before SVD
+    if torch.isnan(matrix).any() or torch.isinf(matrix).any():
+        # Fall back to full SVD if input has non-finite values
+        return torch.linalg.svd(matrix, full_matrices=False)
+    
+    try:
+        u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
+        # Check if result has non-finite values
+        if torch.isnan(u).any() or torch.isnan(s).any() or torch.isnan(v).any() or \
+           torch.isinf(u).any() or torch.isinf(s).any() or torch.isinf(v).any():
+            # Fall back to full SVD
+            return torch.linalg.svd(matrix, full_matrices=False)
+        return u, s, v.mH
+    except RuntimeError:
+        # If low-rank SVD fails, fall back to full SVD
+        return torch.linalg.svd(matrix, full_matrices=False)
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
