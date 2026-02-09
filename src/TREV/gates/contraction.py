@@ -6,10 +6,10 @@ def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
     """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
     m, n = matrix.shape
     k = min(rank, m, n)
-    if k == min(m, n):
-        return torch.linalg.svd(matrix, full_matrices=False)
-    u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
-    return u, s, v.mH
+    #if k == min(m, n):
+    return torch.linalg.svd(matrix, full_matrices=False)
+    # u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
+    # return u, s, v.mH
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
