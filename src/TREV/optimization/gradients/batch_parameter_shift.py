@@ -255,6 +255,40 @@ def expectation_value_batch(
 
 
 
+def _kron_contract_right(Prod, A0, A1, sign=1):
+    """Contract Prod @ E(site) using Kronecker decomposition.
+
+    E = conj(A0)⊗A0 + sign*conj(A1)⊗A1
+    sign=+1 → E_I,  sign=-1 → E_Z.
+
+    Prod: (B, ..., l_bra, l_ket, r_bra, r_ket)  -- last 4 dims are spatial
+    A0, A1: (B, chi, chi)
+
+    Contracts r_bra/r_ket (last 2 dims of Prod) and produces new right indices.
+    A must broadcast over all dims between B and r_bra/r_ket (i.e., middle + l_bra + l_ket).
+    """
+    # Number of dims to broadcast over: everything between B (dim 0) and r_bra/r_ket (last 2)
+    n_broadcast = Prod.dim() - 3  # = n_middle + l_bra + l_ket
+    slices = (slice(None),) + (None,) * n_broadcast + (slice(None), slice(None))
+    A0_e  = A0[slices]                          # (B, 1..., chi, chi)
+    A0H_e = A0.conj().mT[slices]
+    A1_e  = A1[slices]
+    A1H_e = A1.conj().mT[slices]
+
+    r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
+    r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+    return r0 + sign * r1
+
+
+def _make_eye4(B, chi, ctype, device):
+    """Build the 4-D identity: eye4[b, i, j, i, j] = 1 for all i, j.
+
+    Corresponds to the chi^2 x chi^2 identity matrix in reshaped form.
+    """
+    eye2d = torch.eye(chi * chi, dtype=ctype, device=device)  # (chi^2, chi^2)
+    return eye2d.reshape(chi, chi, chi, chi).unsqueeze(0).expand(B, -1, -1, -1, -1)
+
+
 @torch.no_grad()
 def expectation_value_batch_efficient_contraction(
     param_batch: Tensor,                 # (B, P)
@@ -262,27 +296,24 @@ def expectation_value_batch_efficient_contraction(
     hamiltonian,                         # .get_bool_pauli_tensor()->(T,N); .coefficients (len T)
     shots: int,                          # kept for API compatibility (ignored)
     *,
-    term_chunk: Optional[int] = None,    # chunk across Hamiltonian terms
-    cache_double_layers: bool = True,    # cache A0/A1 per site (avoids recompute across term chunks)
+    term_chunk: Optional[int] = None,    # unused, kept for API compat
+    cache_double_layers: bool = True,    # cache A0/A1 per site
     param_chunk: Optional[int] = None,   # split B across chunks to fit memory
     use_complex64: bool = True,          # internal complex precision
 ) -> Tensor:
     """
-    Exact batched <psi|H|psi> via Kronecker-aware double-layer contraction.
+    Exact batched <psi|H|psi> via identity-chain factored Kronecker contraction.
 
-    Exploits the Kronecker structure of transfer matrices:
-      E_I = conj(A0)⊗A0 + conj(A1)⊗A1
-      E_Z = conj(A0)⊗A0 - conj(A1)⊗A1
-    to contract in O(chi^5) per site instead of O(chi^6).
+    Precomputes all-identity left-prefix and right-suffix products, then
+    contracts only at the sparse Z-sites of each Hamiltonian term.
 
-    - Prod kept in 6-D form (B, Tc, chi, chi, chi, chi).
-    - Cache stores per-site (A0, A1) slices: O(N*B*chi^2) memory
-      instead of full transfer matrices O(N*B*chi^4).
-    - Returns (B,) float32 expectations.
+    Complexity: O((N + k*T) * B * chi^5)  instead of  O(N * T * B * chi^5)
+    Memory:     O(N * B * chi^4)  instead of  O(T * B * chi^4)
+
+    where k is the average number of Z-operators per Hamiltonian term.
     """
     device = getattr(circuit, "device", param_batch.device)
 
-    # Split param batch if desired
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
         batch_slices = [(0, B_total)]
@@ -290,11 +321,13 @@ def expectation_value_batch_efficient_contraction(
         batch_slices = [(s, min(s + param_chunk, B_total)) for s in range(0, B_total, param_chunk)]
 
     # Hamiltonian
-    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N)
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=torch.cfloat if use_complex64 else torch.cdouble, device=device)
+    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N) bool
+    coeffs = torch.as_tensor(
+        hamiltonian.coefficients,
+        dtype=torch.cfloat if use_complex64 else torch.cdouble,
+        device=device,
+    )
     T, N = paulis.shape
-    if term_chunk is None:
-        term_chunk = T
 
     out_parts = []
 
@@ -307,92 +340,75 @@ def expectation_value_batch_efficient_contraction(
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
         ctype = torch.complex64 if use_complex64 else torch.complex128
-        chi = l   # l == r for tensor ring
+        chi = l
 
-        # Cache per-site A0/A1 slices: O(N*B*chi^2) vs old O(N*B*chi^4)
-        cached = None
-        if cache_double_layers:
-            cached = []
-            for i in range(N):
-                Ab = ring[:, i].to(ctype)                        # (B, chi, chi, 2)
-                cached.append((
-                    Ab[:, :, :, 0].contiguous(),                 # A0: (B, chi, chi)
-                    Ab[:, :, :, 1].contiguous(),                 # A1: (B, chi, chi)
-                ))
-
-        def _get_site(i):
-            """Return (A0, A1) each (B, chi, chi) for site i."""
-            if cached:
-                return cached[i]
+        # Cache per-site A0/A1 slices
+        sites = []
+        for i in range(N):
             Ab = ring[:, i].to(ctype)
-            return Ab[:, :, :, 0].contiguous(), Ab[:, :, :, 1].contiguous()
+            sites.append((Ab[:, :, :, 0].contiguous(), Ab[:, :, :, 1].contiguous()))
+        del ring
 
+        eye4 = _make_eye4(B, chi, ctype, device)
+
+        # --- Precompute left prefix products under all-identity ---
+        # L_pre[i] = E_I(0) @ E_I(1) @ ... @ E_I(i-1),  L_pre[0] = I
+        # Uses right contraction: acc = acc @ E_I(i)
+        L_pre = [None] * (N + 1)
+        acc = eye4
+        for i in range(N):
+            L_pre[i] = acc
+            A0_i, A1_i = sites[i]
+            acc = _kron_contract_right(acc, A0_i, A1_i)
+        L_pre[N] = acc
+        del acc
+
+        # --- Precompute TRANSPOSED right suffix products under all-identity ---
+        # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T = E_I(N-1)^T @ ... @ E_I(i)^T
+        # R_suf_T[N] = I
+        # Since E_I^T uses A^T instead of A, we pass A.mT to the right-contraction.
+        # Trace formula: Tr(run @ R_suf[i]) = (run * R_suf_T[i]).sum(dims 1..4)
+        R_suf_T = [None] * (N + 1)
+        acc = eye4
+        for i in range(N - 1, -1, -1):
+            A0_i, A1_i = sites[i]
+            acc = _kron_contract_right(acc, A0_i.mT, A1_i.mT)
+            R_suf_T[i] = acc
+        R_suf_T[N] = eye4
+        del acc, eye4
+
+        # --- Per-term contraction: only at Z-sites ---
         totals = torch.zeros(B, dtype=ctype, device=device)
 
-        for t0 in range(0, T, term_chunk):
-            t1 = min(t0 + term_chunk, T)
-            mask = paulis[t0:t1]      # (Tc, N)
-            coefs = coeffs[t0:t1]     # (Tc,)
-            Tc = mask.size(0)
+        for t in range(T):
+            z_sites = torch.where(paulis[t])[0].tolist()
 
-            # --- Site 0: initialise Prod via Kronecker outer products ---
-            # conj(Ad) ⊗ Ad  ->  (B, chi, chi, chi, chi)
-            #   c_d[b, l_bra, l_ket, r_bra, r_ket]
-            #     = conj(Ad[b, l_bra, r_bra]) * Ad[b, l_ket, r_ket]
-            A0_0, A1_0 = _get_site(0)
-            c0 = torch.einsum('blr,bLR->blLrR', A0_0.conj(), A0_0)
-            c1 = torch.einsum('blr,bLR->blLrR', A1_0.conj(), A1_0)
+            if len(z_sites) == 0:
+                # All identity: Tr(full ring) = (L_pre[N] * R_suf_T[N]).sum
+                totals += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
+                continue
 
-            # sign: +1 for I (mask=False), -1 for Z (mask=True)
-            sign = torch.where(mask[:, 0], -1.0, 1.0).to(ctype)
-            # Prod: (B, Tc, chi, chi, chi, chi)
-            Prod = c0.unsqueeze(1) + sign[None, :, None, None, None, None] * c1.unsqueeze(1)
-            del c0, c1
+            s_first = z_sites[0]
+            s_last = z_sites[-1]
 
-            # --- Sites 1..N-1: Kronecker-aware contraction O(chi^5) ---
-            #
-            # Prod @ E_{t,i}  where  E = conj(A0)⊗A0 ± conj(A1)⊗A1
-            #
-            # For a single d:
-            #   (Prod @ conj(Ad)⊗Ad)[.., r'_bra, r'_ket]
-            #     = Σ_{r_bra, r_ket} Prod[.., r_bra, r_ket]
-            #         * conj(Ad)[b, r_bra, r'_bra] * Ad[b, r_ket, r'_ket]
-            #
-            # Decomposed into two chi-matmuls:
-            #   step1  temp = Prod @ Ad          contracts r_ket  O(chi^5)
-            #   step2  r_d  = conj(Ad)^T @ temp  contracts r_bra  O(chi^5)
-            for i in range(1, N):
-                A0_i, A1_i = _get_site(i)
+            # Start from the precomputed left prefix up to the first Z-site
+            run = L_pre[s_first].clone()
 
-                # Broadcast-ready views: (B,1,1,1,chi,chi)
-                A0_e  = A0_i [:, None, None, None, :, :]
-                A0H_e = A0_i.conj().mT[:, None, None, None, :, :]
-                A1_e  = A1_i [:, None, None, None, :, :]
-                A1H_e = A1_i.conj().mT[:, None, None, None, :, :]
+            # Contract through sites s_first..s_last (Z or I as needed)
+            for i in range(s_first, s_last + 1):
+                A0_i, A1_i = sites[i]
+                if paulis[t, i]:
+                    run = _kron_contract_right(run, A0_i, A1_i, sign=-1)
+                else:
+                    run = _kron_contract_right(run, A0_i, A1_i)
 
-                # d=0 contribution: conj(A0)^T @ (Prod @ A0)
-                r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
-                # d=1 contribution: conj(A1)^T @ (Prod @ A1)
-                r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+            # Tr(run @ R_suf[s_last+1]) = element-wise product with transposed suffix
+            totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
 
-                # I -> r0 + r1,  Z -> r0 - r1
-                sign = torch.where(mask[:, i], -1.0, 1.0).to(ctype)
-                Prod = r0 + sign[None, :, None, None, None, None] * r1
-                del r0, r1
+        out_parts.append(totals.real.float())
 
-            # --- Ring closure: trace  Σ_{ij} Prod[b,t,i,j,i,j] ---
-            ll = chi * chi
-            trace_vals = Prod.reshape(B, Tc, ll, ll).diagonal(dim1=2, dim2=3).sum(dim=-1)
+        del sites, L_pre, R_suf_T, totals
 
-            totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
-
-            del Prod, trace_vals
-
-        out_parts.append(totals.real.float())  # (B,)
-
-        del ring, totals, cached
-
-    # concat across param chunks
     return torch.cat(out_parts, dim=0)
 
 
