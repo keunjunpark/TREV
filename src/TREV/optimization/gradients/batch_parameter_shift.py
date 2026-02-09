@@ -263,15 +263,21 @@ def expectation_value_batch_efficient_contraction(
     shots: int,                          # kept for API compatibility (ignored)
     *,
     term_chunk: Optional[int] = None,    # chunk across Hamiltonian terms
-    cache_double_layers: bool = True,    # cache E_I/E_Z per site (avoids recompute across term chunks)
+    cache_double_layers: bool = True,    # cache A0/A1 per site (avoids recompute across term chunks)
     param_chunk: Optional[int] = None,   # split B across chunks to fit memory
     use_complex64: bool = True,          # internal complex precision
 ) -> Tensor:
     """
-    Exact batched <psi|H|psi> via double-layer contraction in MATRIX form.
+    Exact batched <psi|H|psi> via Kronecker-aware double-layer contraction.
 
-    - No rank-5 tensors kept around.
-    - Working set ~ O(B * chi^4) only for the CURRENT site/term-chunk.
+    Exploits the Kronecker structure of transfer matrices:
+      E_I = conj(A0)⊗A0 + conj(A1)⊗A1
+      E_Z = conj(A0)⊗A0 - conj(A1)⊗A1
+    to contract in O(chi^5) per site instead of O(chi^6).
+
+    - Prod kept in 6-D form (B, Tc, chi, chi, chi, chi).
+    - Cache stores per-site (A0, A1) slices: O(N*B*chi^2) memory
+      instead of full transfer matrices O(N*B*chi^4).
     - Returns (B,) float32 expectations.
     """
     device = getattr(circuit, "device", param_batch.device)
@@ -301,34 +307,25 @@ def expectation_value_batch_efficient_contraction(
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
         ctype = torch.complex64 if use_complex64 else torch.complex128
+        chi = l   # l == r for tensor ring
 
-        # Local ops
-        Z = torch.tensor([[1, 0], [0, -1]], dtype=ctype, device=device)
-        I = torch.eye(2, dtype=ctype, device=device)
-
-        ll = l * l
-        rr = r * r
-
-        def site_double_layers_matrix(Ab: Tensor):
-            """
-            Ab: (B,l,r,2)
-            Returns E_I, E_Z each (B, ll, rr).
-            """
-            AO_I = torch.einsum('blrd,dk->blrk', Ab, I)  # (B,l,r,2)
-            AO_Z = torch.einsum('blrd,dk->blrk', Ab, Z)  # (B,l,r,2)
-            EI5 = torch.einsum('blrd,bLRd->blLrR', Ab.conj(), AO_I)
-            EZ5 = torch.einsum('blrd,bLRd->blLrR', Ab.conj(), AO_Z)
-            EI  = EI5.reshape(B, ll, rr)
-            EZ  = EZ5.reshape(B, ll, rr)
-            return EI, EZ
-
-        # Cache per-site double-layer matrices (avoids recompute across term chunks)
+        # Cache per-site A0/A1 slices: O(N*B*chi^2) vs old O(N*B*chi^4)
         cached = None
         if cache_double_layers:
             cached = []
             for i in range(N):
-                EI, EZ = site_double_layers_matrix(ring[:, i].to(ctype))
-                cached.append((EI, EZ))
+                Ab = ring[:, i].to(ctype)                        # (B, chi, chi, 2)
+                cached.append((
+                    Ab[:, :, :, 0].contiguous(),                 # A0: (B, chi, chi)
+                    Ab[:, :, :, 1].contiguous(),                 # A1: (B, chi, chi)
+                ))
+
+        def _get_site(i):
+            """Return (A0, A1) each (B, chi, chi) for site i."""
+            if cached:
+                return cached[i]
+            Ab = ring[:, i].to(ctype)
+            return Ab[:, :, :, 0].contiguous(), Ab[:, :, :, 1].contiguous()
 
         totals = torch.zeros(B, dtype=ctype, device=device)
 
@@ -338,39 +335,54 @@ def expectation_value_batch_efficient_contraction(
             coefs = coeffs[t0:t1]     # (Tc,)
             Tc = mask.size(0)
 
-            if cache_double_layers:
-                EI0, EZ0 = cached[0]
-            else:
-                EI0, EZ0 = site_double_layers_matrix(ring[:, 0].to(ctype))
+            # --- Site 0: initialise Prod via Kronecker outer products ---
+            # conj(Ad) ⊗ Ad  ->  (B, chi, chi, chi, chi)
+            #   c_d[b, l_bra, l_ket, r_bra, r_ket]
+            #     = conj(Ad[b, l_bra, r_bra]) * Ad[b, l_ket, r_ket]
+            A0_0, A1_0 = _get_site(0)
+            c0 = torch.einsum('blr,bLR->blLrR', A0_0.conj(), A0_0)
+            c1 = torch.einsum('blr,bLR->blLrR', A1_0.conj(), A1_0)
 
-            m0 = mask[:, 0].view(1, Tc, 1, 1)  # broadcast
-            Prod = torch.where(
-                m0,
-                EZ0.unsqueeze(1).expand(-1, Tc, -1, -1),
-                EI0.unsqueeze(1).expand(-1, Tc, -1, -1),
-            ).contiguous()  # (B,Tc,ll,rr)
+            # sign: +1 for I (mask=False), -1 for Z (mask=True)
+            sign = torch.where(mask[:, 0], -1.0, 1.0).to(ctype)
+            # Prod: (B, Tc, chi, chi, chi, chi)
+            Prod = c0.unsqueeze(1) + sign[None, :, None, None, None, None] * c1.unsqueeze(1)
+            del c0, c1
 
-            # Sweep remaining sites
+            # --- Sites 1..N-1: Kronecker-aware contraction O(chi^5) ---
+            #
+            # Prod @ E_{t,i}  where  E = conj(A0)⊗A0 ± conj(A1)⊗A1
+            #
+            # For a single d:
+            #   (Prod @ conj(Ad)⊗Ad)[.., r'_bra, r'_ket]
+            #     = Σ_{r_bra, r_ket} Prod[.., r_bra, r_ket]
+            #         * conj(Ad)[b, r_bra, r'_bra] * Ad[b, r_ket, r'_ket]
+            #
+            # Decomposed into two chi-matmuls:
+            #   step1  temp = Prod @ Ad          contracts r_ket  O(chi^5)
+            #   step2  r_d  = conj(Ad)^T @ temp  contracts r_bra  O(chi^5)
             for i in range(1, N):
-                if cache_double_layers:
-                    EIi, EZi = cached[i]
-                else:
-                    EIi, EZi = site_double_layers_matrix(ring[:, i].to(ctype))
+                A0_i, A1_i = _get_site(i)
 
-                mi = mask[:, i].view(1, Tc, 1, 1)
-                Ei = torch.where(
-                    mi,
-                    EZi.unsqueeze(1).expand(-1, Tc, -1, -1),
-                    EIi.unsqueeze(1).expand(-1, Tc, -1, -1),
-                )  # (B,Tc,ll,rr)
+                # Broadcast-ready views: (B,1,1,1,chi,chi)
+                A0_e  = A0_i [:, None, None, None, :, :]
+                A0H_e = A0_i.conj().mT[:, None, None, None, :, :]
+                A1_e  = A1_i [:, None, None, None, :, :]
+                A1H_e = A1_i.conj().mT[:, None, None, None, :, :]
 
-                Prod = torch.matmul(
-                    Prod.reshape(B * Tc, ll, rr),
-                    Ei.reshape(B * Tc, rr, rr),
-                ).reshape(B, Tc, ll, rr)
+                # d=0 contribution: conj(A0)^T @ (Prod @ A0)
+                r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
+                # d=1 contribution: conj(A1)^T @ (Prod @ A1)
+                r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
 
-            # Ring closure: trace over diagonal
-            trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)  # (B,Tc)
+                # I -> r0 + r1,  Z -> r0 - r1
+                sign = torch.where(mask[:, i], -1.0, 1.0).to(ctype)
+                Prod = r0 + sign[None, :, None, None, None, None] * r1
+                del r0, r1
+
+            # --- Ring closure: trace  Σ_{ij} Prod[b,t,i,j,i,j] ---
+            ll = chi * chi
+            trace_vals = Prod.reshape(B, Tc, ll, ll).diagonal(dim1=2, dim2=3).sum(dim=-1)
 
             totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
 
