@@ -11,7 +11,7 @@ from ...circuit import Circuit
 from ...hamiltonian.hamiltonian import Hamiltonian
 from ...measure.enums import MeasureMethod
 from ...optimization.gradients.gradient import Gradient
-
+from TREV.measure.contraction import precompute_double_layer_and_right_suffix
 
 def _gpu_info(device: torch.device) -> str:
     if device.type != "cuda":
@@ -415,7 +415,7 @@ def expectation_value_batch_efficient_contraction(
 @torch.no_grad()
 def expectation_value_batch_right_suffix(
     param_batch: torch.Tensor,           # (B_total, P)
-    circuit,                             # .device and build_tensor_batch(params,B)->(B,N,chi,chi,2)
+    circuit,                             # .device and build_tensor_batch(params,B)->(B,N,χ,χ,2)
     hamiltonian,                         # .get_bool_pauli_tensor()->(T,N) bool; .coefficients (len T)
     shots: int = 10_000,
     chunk_size: Optional[int] = None,    # shots chunk
@@ -427,7 +427,7 @@ def expectation_value_batch_right_suffix(
     use_complex64: bool = True,          # internal complex precision
 ) -> torch.Tensor:
     """
-    Batched Monte Carlo <psi(theta)|H|psi(theta)> via right-suffix sampling.
+    Batched Monte Carlo ⟨ψ(θ)|H|ψ(θ)⟩ via right-suffix sampling.
     Vectorizes over parameter sets (B) and samples (S), and streams Hamiltonian terms in chunks.
 
     Returns:
@@ -435,7 +435,7 @@ def expectation_value_batch_right_suffix(
     """
     device = getattr(circuit, "device", param_batch.device)
     ctype = torch.complex64 if use_complex64 else torch.complex128
-
+    
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
         batch_slices = [(0, B_total)]
@@ -461,30 +461,35 @@ def expectation_value_batch_right_suffix(
         # ---- Build Tensor-Ring cores for this param sub-batch
         param_view = param_batch[lo:hi]                      # (B, P)
         B = int(param_view.shape[0])
-        ring = circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
+        ring = circuit.build_tensor_batch(param_view, B)     # (B, N, χ, χ, 2)
         _, N_chk, chi_l, chi_r, d = ring.shape
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l
-        chi2 = chi * chi
 
-        # ---- Vectorized precomputation over all B at once (no per-b Python loop) ----
-        A0_sites = [ring[:, i, :, :, 0].to(ctype).contiguous() for i in range(N)]  # each (B, chi, chi)
-        A1_sites = [ring[:, i, :, :, 1].to(ctype).contiguous() for i in range(N)]  # each (B, chi, chi)
+        # ---- Precompute right-suffix objects per-parameter, stack across B
+        # We only need the *R4* suffix tensors for sampling:
+        #   R4[i] shape (χ,χ,χ,χ) per parameter -> stack to (B,χ,χ,χ,χ) per site.
+        # We also prepare A0/A1 per site stacked across B.
+        R4_stack = []
+        A0_stack = []
+        A1_stack = []
+        # precompute_double_layer_and_right_suffix expects a single-(N,χ,χ,2) ring per parameter
+        for b in range(B):
+            Es, R_suf, d2, _, _ = precompute_double_layer_and_right_suffix(ring[b])
+            # Cast once to consistent dtype and layout
+            R4_b = [Ri.to(ctype).view(chi, chi, chi, chi).permute(2, 3, 0, 1).contiguous()
+                    for Ri in R_suf]  # -> (χ,χ,χ,χ) with indices (a,c,b,d) order used below
+            A0_b = [ring[b, i, :, :, 0].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
+            A1_b = [ring[b, i, :, :, 1].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
+            R4_stack.append(R4_b)
+            A0_stack.append(A0_b)
+            A1_stack.append(A1_b)
 
-        # Batched double-layer: E = A0* (x) A0 + A1* (x) A1, shape (B, chi^2, chi^2)
-        def _batched_E(A0i, A1i):
-            E0 = torch.einsum('bij,bkl->bikjl', A0i.conj(), A0i).reshape(B, chi2, chi2)
-            E1 = torch.einsum('bij,bkl->bikjl', A1i.conj(), A1i).reshape(B, chi2, chi2)
-            return E0 + E1
-
-        # Build right suffix products: R_suf[i] = E_{i+1} @ ... @ E_{N-1}
-        acc = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).clone()
-        R_suf = [None] * N
-        for i in range(N - 1, -1, -1):
-            R_suf[i] = acc                                    # (B, chi^2, chi^2)
-            Ei = _batched_E(A0_sites[i], A1_sites[i])
-            acc = torch.bmm(Ei, acc)
-        del acc
+        # Now stack across B for each site i -> tensors:
+        #   R4_sites[i] : (B, χ,χ,χ,χ); A0_sites[i]/A1_sites[i] : (B, χ,χ)
+        R4_sites = [torch.stack([R4_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
+        A0_sites = [torch.stack([A0_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
+        A1_sites = [torch.stack([A1_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
 
         # ---- Monte Carlo accumulation over shot-chunks
         totals = torch.zeros(B, dtype=torch.float64, device=device)
@@ -496,37 +501,39 @@ def expectation_value_batch_right_suffix(
             s1 = min(s0 + chunk_size, shots)
             S  = s1 - s0
 
-            # X: (B,S,chi,chi), start as identity per (B,S)
+            # X: (B,S,χ,χ), start as identity per (B,S)
             X = Ichi.expand(B, S, chi, chi).clone()
             # bits: (B,S,N) bool
             bits = torch.empty((B, S, N), dtype=torch.bool, device=device)
 
             # Sweep sites
             for i in range(N):
-                A0i = A0_sites[i].unsqueeze(1)                # (B, 1, chi, chi)
-                A1i = A1_sites[i].unsqueeze(1)                # (B, 1, chi, chi)
+                A0i = A0_sites[i]                    # (B, χ, χ)
+                A1i = A1_sites[i]                    # (B, χ, χ)
+                R4i = R4_sites[i]                    # (B, χ, χ, χ, χ)
 
-                M0 = torch.matmul(X, A0i)                     # (B, S, chi, chi)
-                M1 = torch.matmul(X, A1i)
+                # Broadcast A* to (B,S,χ,χ) for batched matmul
+                A0i_bs = A0i.unsqueeze(1)            # (B,1,χ,χ)
+                A1i_bs = A1i.unsqueeze(1)            # (B,1,χ,χ)
 
-                # Matrix-form weights: w = v^dag R v  (no R4 5D tensors needed)
-                Ri = R_suf[i]                                  # (B, chi^2, chi^2)
-                v0 = M0.reshape(B, S, chi2)
-                v1 = M1.reshape(B, S, chi2)
-                y0 = torch.einsum('bij,bsj->bsi', Ri, v0)     # batched mat-vec
-                y1 = torch.einsum('bij,bsj->bsi', Ri, v1)
-                w0 = (v0.conj() * y0).sum(dim=-1).real         # (B, S)
-                w1 = (v1.conj() * y1).sum(dim=-1).real         # (B, S)
+                M0 = torch.matmul(X, A0i_bs)         # (B,S,χ,χ)
+                M1 = torch.matmul(X, A1i_bs)         # (B,S,χ,χ)
 
+                # Weights w0, w1 ∝ ⟨Mσ| R4 |Mσ⟩  (σ in {0,1}) — keep real part for probs
+                # Indices: M0 -> (B,S,a,b); M0.conj -> (B,S,c,d); R4 -> (B,a,c,b,d)  => (B,S)
+                # w0 = torch.einsum('bsab,bscd,bacbd->bs', M0, M0.conj(), R4i).real
+                # w1 = torch.einsum('bsab,bscd,bacbd->bs', M1, M1.conj(), R4i).real
+                w0 = torch.einsum('xsab,xscd,xacbd->xs', M0, M0.conj(), R4i).real
+                w1 = torch.einsum('xsab,xscd,xacbd->xs', M1, M1.conj(), R4i).real
                 den = (w0 + w1).clamp_min(1e-300)
-                p1  = w1 / den                                 # (B, S)
+                p1  = (w1 / den)                      # (B,S)
 
                 u   = torch.rand((B, S), generator=gen, device=device)
-                si  = (u < p1)                                 # True => choose 1, else 0
+                si  = (u < p1)                        # True => choose 1, else 0
                 bits[:, :, i] = si
 
                 si_view = si.view(B, S, 1, 1)
-                X = torch.where(si_view, M1, M0)               # select next prefix
+                X = torch.where(si_view, M1, M0)      # select next prefix
 
                 # Periodic normalization for numerical stability
                 if normalize_every > 0 and (i % normalize_every) == 0 and i != 0:
@@ -556,11 +563,11 @@ def expectation_value_batch_right_suffix(
         out_parts.append((totals / done.clamp_min(1)).detach())  # (B,)
 
         # Free per-chunk buffers
-        del ring, R_suf, A0_sites, A1_sites
+        del ring, R4_stack, A0_stack, A1_stack, R4_sites, A0_sites, A1_sites
+        torch.cuda.empty_cache()
 
     # Concatenate across parameter chunks and move to CPU
     return torch.cat(out_parts, dim=0).cpu()
-
 
 @torch.no_grad()
 def expectation_value_batch_correct_sampling(
