@@ -53,10 +53,10 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     mps = torch.moveaxis(mps, 1, 2).reshape((chi_1 * 2, chi_3 * 2))
     # mps: 2 × χ1 × 2 × χ3 --> (2 * χ1) × (2 * χ3)
 
-    if chi_1 != chi_3:
-        u, s, v = torch.linalg.svd(mps)
-    else:
-        u, s, v = _truncated_svd(mps, chi_1)
+    #if chi_1 != chi_3:
+    u, s, v = torch.linalg.svd(mps)
+    # else:
+    #     u, s, v = _truncated_svd(mps, chi_1)
     # u: (2 * χ1) × (2 * χ1)
     # s: 2 * min(χ1,χ3)
     # y: (2 * χ3) × (2 * χ3)
