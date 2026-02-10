@@ -115,20 +115,20 @@ def  _apply_double_qubit_gate_batch(
 
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
-    if chi1 != chi3:
-        u, s, vh = torch.linalg.svd(mps)   # u: (B, 2χ1, 2χ1),  vh: (B, 2χ3, 2χ3)
-    else:
-        u_list = []
-        s_list = []
-        vh_list = []
-        for b in range(B):
-            ub, sb, vhb = _truncated_svd(mps[b], chi1)
-            u_list.append(ub)
-            s_list.append(sb)
-            vh_list.append(vhb)
-        u = torch.stack(u_list, dim=0)
-        s = torch.stack(s_list, dim=0)
-        vh = torch.stack(vh_list, dim=0)
+    #  if chi1 != chi3:
+    u, s, vh = torch.linalg.svd(mps)   # u: (B, 2χ1, 2χ1),  vh: (B, 2χ3, 2χ3)
+    # else:
+    #     u_list = []
+    #     s_list = []
+    #     vh_list = []
+    #     for b in range(B):
+    #         ub, sb, vhb = _truncated_svd(mps[b], chi1)
+    #         u_list.append(ub)
+    #         s_list.append(sb)
+    #         vh_list.append(vhb)
+    #     u = torch.stack(u_list, dim=0)
+    #     s = torch.stack(s_list, dim=0)
+    #     vh = torch.stack(vh_list, dim=0)
 
     # Keep the same number of singular vectors you did in the scalar path
     x  = u[:, :, :chi1]                                     # (B, 2χ1, χ1)
