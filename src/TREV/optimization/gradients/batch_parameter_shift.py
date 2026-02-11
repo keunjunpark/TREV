@@ -466,18 +466,32 @@ def expectation_value_batch_right_suffix(
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l
 
-        # ---- Precompute R_suf via established function, stack across B
+        # ---- Batched R_suf via Kronecker-free O(χ⁵) contraction
+        # Computes kron(A_d, conj(A_d)) @ acc as two matmuls per d,
+        # avoiding O(χ⁶) explicit E construction. Same kron convention as
+        # precompute_double_layer_and_right_suffix.
         chi2 = chi * chi
         A0_sites = [ring[:, i, :, :, 0].to(ctype).contiguous() for i in range(N)]
         A1_sites = [ring[:, i, :, :, 1].to(ctype).contiguous() for i in range(N)]
-
-        # Pre-allocate batched R_suf tensors (one per site)
-        R_suf = [torch.empty(B, chi2, chi2, dtype=ctype, device=device) for _ in range(N)]
-        for b in range(B):
-            _, R_suf_b, _, _, _ = precompute_double_layer_and_right_suffix(ring[b])
-            for i in range(N):
-                R_suf[i][b] = R_suf_b[i].to(ctype)
         del ring
+
+        acc = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+        R_suf = [None] * N
+        for i in range(N - 1, -1, -1):
+            R_suf[i] = acc
+            A0i, A1i = A0_sites[i], A1_sites[i]
+            acc_view = acc.view(B, chi, chi, chi2)
+            # kron(A0, conj(A0)) @ acc
+            temp = torch.matmul(A0i.conj().unsqueeze(1), acc_view)
+            new_acc = torch.matmul(A0i, temp.reshape(B, chi, chi * chi2))
+            del temp
+            # kron(A1, conj(A1)) @ acc
+            temp = torch.matmul(A1i.conj().unsqueeze(1), acc_view)
+            new_acc += torch.matmul(A1i, temp.reshape(B, chi, chi * chi2))
+            del temp
+            acc = new_acc.view(B, chi, chi, chi2).reshape(B, chi2, chi2).contiguous()
+            del new_acc
+        del acc
 
         # Convert R_suf from kron convention to bilinear form for matmul weights
         # kron: E[ij,kl] = A[i,k]*conj(A[j,l])
