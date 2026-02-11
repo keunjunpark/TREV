@@ -466,30 +466,28 @@ def expectation_value_batch_right_suffix(
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l
 
-        # ---- Precompute right-suffix objects per-parameter, stack across B
-        # We only need the *R4* suffix tensors for sampling:
-        #   R4[i] shape (χ,χ,χ,χ) per parameter -> stack to (B,χ,χ,χ,χ) per site.
-        # We also prepare A0/A1 per site stacked across B.
-        R4_stack = []
-        A0_stack = []
-        A1_stack = []
-        # precompute_double_layer_and_right_suffix expects a single-(N,χ,χ,2) ring per parameter
-        for b in range(B):
-            Es, R_suf, d2, _, _ = precompute_double_layer_and_right_suffix(ring[b])
-            # Cast once to consistent dtype and layout
-            R4_b = [Ri.to(ctype).view(chi, chi, chi, chi).permute(2, 3, 0, 1).contiguous()
-                    for Ri in R_suf]  # -> (χ,χ,χ,χ) with indices (a,c,b,d) order used below
-            A0_b = [ring[b, i, :, :, 0].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
-            A1_b = [ring[b, i, :, :, 1].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
-            R4_stack.append(R4_b)
-            A0_stack.append(A0_b)
-            A1_stack.append(A1_b)
+        # ---- Precompute R_suf via established function, stack across B
+        chi2 = chi * chi
+        A0_sites = [ring[:, i, :, :, 0].to(ctype).contiguous() for i in range(N)]
+        A1_sites = [ring[:, i, :, :, 1].to(ctype).contiguous() for i in range(N)]
 
-        # Now stack across B for each site i -> tensors:
-        #   R4_sites[i] : (B, χ,χ,χ,χ); A0_sites[i]/A1_sites[i] : (B, χ,χ)
-        R4_sites = [torch.stack([R4_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
-        A0_sites = [torch.stack([A0_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
-        A1_sites = [torch.stack([A1_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
+        # Pre-allocate batched R_suf tensors (one per site)
+        R_suf = [torch.empty(B, chi2, chi2, dtype=ctype, device=device) for _ in range(N)]
+        for b in range(B):
+            _, R_suf_b, _, _, _ = precompute_double_layer_and_right_suffix(ring[b])
+            for i in range(N):
+                R_suf[i][b] = R_suf_b[i].to(ctype)
+        del ring
+
+        # Convert R_suf from kron convention to bilinear form for matmul weights
+        # kron: E[ij,kl] = A[i,k]*conj(A[j,l])
+        # bilinear: R_bl[a·χ+b, c·χ+d] = conj(R_kron[b·χ+d, a·χ+c])
+        for i in range(N):
+            R_suf[i] = (R_suf[i].view(B, chi, chi, chi, chi)
+                        .permute(0, 3, 1, 4, 2)
+                        .conj()
+                        .contiguous()
+                        .reshape(B, chi2, chi2))
 
         # ---- Monte Carlo accumulation over shot-chunks
         totals = torch.zeros(B, dtype=torch.float64, device=device)
@@ -510,21 +508,18 @@ def expectation_value_batch_right_suffix(
             for i in range(N):
                 A0i = A0_sites[i]                    # (B, χ, χ)
                 A1i = A1_sites[i]                    # (B, χ, χ)
-                R4i = R4_sites[i]                    # (B, χ, χ, χ, χ)
+                Ri  = R_suf[i]                       # (B, χ², χ²)
 
-                # Broadcast A* to (B,S,χ,χ) for batched matmul
-                A0i_bs = A0i.unsqueeze(1)            # (B,1,χ,χ)
-                A1i_bs = A1i.unsqueeze(1)            # (B,1,χ,χ)
+                M0 = torch.matmul(X, A0i.unsqueeze(1))  # (B,S,χ,χ)
+                M1 = torch.matmul(X, A1i.unsqueeze(1))  # (B,S,χ,χ)
 
-                M0 = torch.matmul(X, A0i_bs)         # (B,S,χ,χ)
-                M1 = torch.matmul(X, A1i_bs)         # (B,S,χ,χ)
-
-                # Weights w0, w1 ∝ ⟨Mσ| R4 |Mσ⟩  (σ in {0,1}) — keep real part for probs
-                # Indices: M0 -> (B,S,a,b); M0.conj -> (B,S,c,d); R4 -> (B,a,c,b,d)  => (B,S)
-                # w0 = torch.einsum('bsab,bscd,bacbd->bs', M0, M0.conj(), R4i).real
-                # w1 = torch.einsum('bsab,bscd,bacbd->bs', M1, M1.conj(), R4i).real
-                w0 = torch.einsum('xsab,xscd,xacbd->xs', M0, M0.conj(), R4i).real
-                w1 = torch.einsum('xsab,xscd,xacbd->xs', M1, M1.conj(), R4i).real
+                # Weights via bilinear form: w_d = vec(M_d)† @ R_suf @ vec(M_d)
+                v0 = M0.reshape(B, S, chi2)
+                v1 = M1.reshape(B, S, chi2)
+                y0 = torch.matmul(v0, Ri.mT)        # (B,S,χ²)
+                y1 = torch.matmul(v1, Ri.mT)        # (B,S,χ²)
+                w0 = (v0.conj() * y0).sum(-1).real   # (B,S)
+                w1 = (v1.conj() * y1).sum(-1).real   # (B,S)
                 den = (w0 + w1).clamp_min(1e-300)
                 p1  = (w1 / den)                      # (B,S)
 
@@ -563,7 +558,7 @@ def expectation_value_batch_right_suffix(
         out_parts.append((totals / done.clamp_min(1)).detach())  # (B,)
 
         # Free per-chunk buffers
-        del ring, R4_stack, A0_stack, A1_stack, R4_sites, A0_sites, A1_sites
+        del R_suf, A0_sites, A1_sites
         torch.cuda.empty_cache()
 
     # Concatenate across parameter chunks and move to CPU
