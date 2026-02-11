@@ -2,6 +2,7 @@
 Core Class that can handle all.
 Similar as much as possible from qiskit.
 """
+import copy
 from typing import List, Literal
 
 import torch
@@ -20,6 +21,23 @@ class Circuit(torch.nn.Module):
         self.params_size:int = 0
         self.num_qubit = num_qubit
         self.device = device
+
+    def to_device(self, device: str) -> 'Circuit':
+        """Create a lightweight clone targeting a different device.
+
+        Shallow-copies the Circuit and rebuilds the gate list with updated
+        device attributes.  No tensor copying — gate matrices are created
+        on-the-fly in apply/apply_batch.
+        """
+        clone = copy.copy(self)
+        clone.device = device
+        clone.gates = []
+        for gate in self.gates:
+            g = copy.copy(gate)
+            g.device = device
+            clone.gates.append(g)
+        return clone
+
     def id(self, qubit: int):
         self.gates.append(NonParameterOneQubitGate(qubit, I,self.device))
 

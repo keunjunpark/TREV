@@ -1,5 +1,6 @@
 import time
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 import torch
@@ -35,8 +36,51 @@ def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_meth
         return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
 
 
+def _get_gpu_count() -> int:
+    """Return the number of available CUDA GPUs, or 0 if CUDA is unavailable."""
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
+def _worker_gradient_chunk(
+    ranges: list,
+    base: Tensor,
+    circuit_clone: Circuit,
+    hamiltonian: Hamiltonian,
+    shift: float,
+    shots: int,
+    measure_method: MeasureMethod,
+    chunk_size: int,
+) -> list:
+    """Compute gradient slices for assigned parameter index ranges on one GPU.
+
+    Each range is a (start, stop) tuple of parameter indices.
+    Returns a list of (start, stop, grad_slice_cpu) tuples.
+    """
+    device = circuit_clone.device
+    P = base.shape[1]
+    base_dev = base.to(device)
+    results = []
+
+    for start, stop in ranges:
+        C = stop - start
+        idx = torch.arange(start, stop, device=device)
+        arange_C = torch.arange(C, device=device)
+
+        batch = base_dev.expand(2 * C, -1).clone()
+        batch[arange_C, idx] += shift
+        batch[C + arange_C, idx] -= shift
+
+        exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+        grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+        results.append((start, stop, grad_slice.cpu()))
+
+    return results
+
+
 class BatchParameterShiftGradient(Gradient):
-    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False):
+    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False, num_gpus: int | None = None):
         super().__init__(measure_method)
         self.shift = shift
         self.batch_size = batch_size  # may be None
@@ -45,6 +89,12 @@ class BatchParameterShiftGradient(Gradient):
         self.curr_depth = 0
         self.is_partial = is_partial
         self._autotuned = False
+
+        # Multi-GPU: auto-detect if None
+        if num_gpus is None:
+            self._num_gpus = _get_gpu_count()
+        else:
+            self._num_gpus = num_gpus
 
         # optional: control printing via env var
         self._verbose = True
@@ -80,15 +130,15 @@ class BatchParameterShiftGradient(Gradient):
             self._autotuned = True
 
             if self._verbose:
-                print(
-                    f"[TREV] Auto batch_size selected: {self.batch_size} "
-                    f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
-                    f"\n"
-                    , flush=True
-                )
+                gpu_msg = f"[TREV] Auto batch_size selected: {self.batch_size} " \
+                          f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
+                if self._num_gpus > 1:
+                    gpu_msg += f"\n[TREV] Multi-GPU enabled: {self._num_gpus} GPUs"
+                print(gpu_msg + "\n", flush=True)
 
         val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
-                             self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method)
+                             self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
+                             num_gpus=self._num_gpus)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
 
@@ -103,13 +153,15 @@ def batch_gradient(
         depth:int,
         curr_depth:int,
         is_partial:bool,
-        measure_method: MeasureMethod
+        measure_method: MeasureMethod,
+        num_gpus: int | None = None,
 ) -> torch.Tensor:
     """
     Memory-frugal parameter-shift gradient.
 
     params   : (P,)  -- single circuit's parameters
     chunk_size  : how many theta-indices to shift at once
+    num_gpus : number of GPUs to use (None or <=1 for single-GPU)
     returns     : (P,)  -- gradient d<O>/d_theta
     """
     with torch.no_grad():
@@ -133,6 +185,47 @@ def batch_gradient(
 
             exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
+        elif num_gpus is not None and num_gpus > 1 and P > 0:
+            # --- Multi-GPU path ---
+            # Build chunk ranges
+            all_ranges = []
+            for start in range(0, P, chunk_size):
+                stop = min(start + chunk_size, P)
+                all_ranges.append((start, stop))
+
+            # Round-robin assign chunks to GPUs
+            gpu_ranges: dict[int, list] = {i: [] for i in range(num_gpus)}
+            for idx_r, r in enumerate(all_ranges):
+                gpu_ranges[idx_r % num_gpus].append(r)
+
+            # Create per-GPU circuit clones
+            gpu_circuits = {}
+            for gpu_id in range(num_gpus):
+                if gpu_ranges[gpu_id]:
+                    gpu_circuits[gpu_id] = circuit.to_device(f'cuda:{gpu_id}')
+
+            # Launch workers via ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                futures = {}
+                for gpu_id, ranges in gpu_ranges.items():
+                    if not ranges:
+                        continue
+                    futures[executor.submit(
+                        _worker_gradient_chunk,
+                        ranges,
+                        base.cpu(),
+                        gpu_circuits[gpu_id],
+                        hamiltonian,
+                        shift,
+                        shots,
+                        measure_method,
+                        chunk_size,
+                    )] = gpu_id
+
+                for future in as_completed(futures):
+                    results = future.result()
+                    for start, stop, grad_slice_cpu in results:
+                        grad[start:stop] = grad_slice_cpu.to(device)
         else:
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
