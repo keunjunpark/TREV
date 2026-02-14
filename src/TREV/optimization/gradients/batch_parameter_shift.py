@@ -81,10 +81,13 @@ def _worker_gradient_chunk(
 
 
 def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
-                  shift, shots, measure_method, chunk_size, result_queue):
+                  shift, shots, measure_method, chunk_size, result_queue,
+                  done_event):
     """Process worker for multi-GPU gradient computation.
 
     Each process owns one GPU, avoids GIL contention for sampling-heavy methods.
+    Must stay alive until parent signals done_event, so FD-based tensor sharing
+    completes before the resource sharer shuts down.
     """
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
@@ -105,6 +108,7 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
         results.append((start, stop, grad_slice.cpu()))
 
     result_queue.put(results)
+    done_event.wait()  # stay alive until parent has consumed all results
 
 
 class BatchParameterShiftGradient(Gradient):
@@ -233,6 +237,7 @@ def batch_gradient(
             # Launch worker processes (spawn context for CUDA safety)
             ctx = mp.get_context('spawn')
             result_queue = ctx.Queue()
+            done_event = ctx.Event()
             processes = []
             for gpu_id in range(num_gpus):
                 if not gpu_ranges[gpu_id]:
@@ -241,7 +246,7 @@ def batch_gradient(
                     target=_mp_worker_fn,
                     args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
                           hamiltonian, shift, shots, measure_method,
-                          chunk_size, result_queue),
+                          chunk_size, result_queue, done_event),
                 )
                 p.start()
                 processes.append(p)
@@ -252,6 +257,8 @@ def batch_gradient(
                 for start, stop, grad_slice_cpu in results:
                     grad[start:stop] = grad_slice_cpu.to(device)
 
+            # Signal children they can exit, then join
+            done_event.set()
             for p in processes:
                 p.join()
         else:
