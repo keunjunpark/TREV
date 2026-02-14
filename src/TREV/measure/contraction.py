@@ -159,6 +159,41 @@ def precompute_double_layer_and_right_suffix(cores):
     R_suf = [Rpref_rev[n - (i + 1)] for i in range(n)]
     return Es, R_suf, d2, device, dtype
 
+def _left_mul_E_4d(A0, A1, R_4d, chi):
+    """Compute E @ R in 4D using Kronecker-factored O(chi^5) contractions.
+
+    E = kron(A0, conj(A0)) + kron(A1, conj(A1))  (full transfer matrix)
+    R_4d: (chi, chi, chi, chi) — right environment in 4D form.
+    Result: (chi, chi, chi, chi)
+    """
+    cd = chi * chi
+    R_r = R_4d.reshape(chi, chi, cd)              # (i, j, c*d)
+    # Contract ket index j with conj(As), then bra index i with As
+    temp0 = torch.matmul(A0.conj(), R_r)           # (i, b, c*d)
+    temp1 = torch.matmul(A1.conj(), R_r)           # (i, b, c*d)
+    bcd = chi * cd
+    temp0 = temp0.reshape(chi, bcd)                 # (i, b*c*d)
+    temp1 = temp1.reshape(chi, bcd)
+    r0 = torch.matmul(A0, temp0).reshape(chi, chi, chi, chi)  # (a, b*c*d) → 4D
+    r1 = torch.matmul(A1, temp1).reshape(chi, chi, chi, chi)
+    return r0 + r1
+
+
+def _right_mul_L_Es_4d(L_4d, As, chi):
+    """Compute L @ E_s in 4D for a single spin value s.
+
+    E_s = kron(As, conj(As))
+    L_4d: (chi, chi, chi, chi) — left environment in 4D form.
+    Result: (chi, chi, chi, chi)
+    """
+    # Step 1: contract last dim of L (ket) with conj(As)
+    temp = torch.matmul(L_4d, As.conj())           # (a, b, i, d) — O(chi^5)
+    # Step 2: contract dim i (bra) with As
+    temp_3d = temp.reshape(chi * chi, chi, chi)     # (a*b, i, d)
+    result = torch.matmul(As.mT, temp_3d)           # (a*b, c, d) — O(chi^5)
+    return result.reshape(chi, chi, chi, chi)
+
+
 @torch.no_grad()
 def argmax_tr_noinv_BE(cores, tie_break='random'):
     """
@@ -167,24 +202,52 @@ def argmax_tr_noinv_BE(cores, tie_break='random'):
     - no solves/inverses
     - single pass using left & right environments
     - tie_break: '0', '1', or 'random'
+
+    Uses Kronecker-factored O(chi^5) contractions instead of O(chi^6).
     """
-    Es, R_suf, d2, device, dtype = precompute_double_layer_and_right_suffix(cores)
-    n = len(Es)
+    n = len(cores)
+    device = cores[0].device
+    dtype = torch.complex128 if torch.is_complex(cores[0]) else torch.float64
+
+    # Extract A0, A1 matrices from cores: each core is (chi, chi, 2)
+    core_list = []
+    for c in cores:
+        c = c.to(dtype)
+        core_list.append((c[:, :, 0], c[:, :, 1]))
+
+    chi = cores[0].shape[0]
+
+    # Identity in 4D: eye(chi^2).reshape(chi, chi, chi, chi)
+    I_4d = torch.eye(chi * chi, dtype=dtype, device=device).reshape(chi, chi, chi, chi)
+
+    # Build right suffixes in 4D
+    # R_suf[i] = E_{i+1} @ ... @ E_{n-1}
+    R_suf = [None] * n
+    acc = I_4d.clone()
+    R_suf[n - 1] = acc
+    for k in range(n - 2, -1, -1):
+        A0, A1 = core_list[k + 1]
+        acc = _left_mul_E_4d(A0, A1, acc, chi)
+        R_suf[k] = acc
 
     out = torch.empty(n, dtype=torch.long, device='cpu')
 
-    # Left environment at the cut
-    L = torch.eye(d2, dtype=dtype, device=device)
+    # Left environment in 4D
+    L = I_4d.clone()
 
     for i in range(n):
-        Ei0, Ei1 = Es[i]
-        T0 = L @ Ei0
-        T1 = L @ Ei1
-        Ri = R_suf[i]
+        A0, A1 = core_list[i]
 
-        # Unnormalized weights: w_s = Tr( (L E_i(s)) Ri )
-        w0 = torch.trace(T0 @ Ri).real
-        w1 = torch.trace(T1 @ Ri).real
+        # T_s = L @ E_i(s) for s=0,1
+        T0 = _right_mul_L_Es_4d(L, A0, chi)
+        T1 = _right_mul_L_Es_4d(L, A1, chi)
+
+        Ri = R_suf[i]
+        Ri_perm = Ri.permute(2, 3, 0, 1)
+
+        # w_s = Tr(T_s @ Ri) = (T_s * Ri_perm).sum()
+        w0 = (T0 * Ri_perm).sum().real
+        w1 = (T1 * Ri_perm).sum().real
 
         # Clamp small/negative numerical noise
         w0c = torch.clamp(w0, min=0.0)
@@ -204,8 +267,8 @@ def argmax_tr_noinv_BE(cores, tie_break='random'):
         out[i] = si
         L = T1 if si == 1 else T0  # update left environment
 
-        # Optional stabilization
-        nL = torch.linalg.norm(L.reshape(-1)).clamp_min(1e-300)
+        # Stabilization
+        nL = L.reshape(-1).norm().clamp_min(1e-300)
         L = L / nL
 
     return out
