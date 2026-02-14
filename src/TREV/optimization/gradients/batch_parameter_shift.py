@@ -2,6 +2,7 @@ import time
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import torch.multiprocessing as mp
 
 import torch
 from torch import Tensor, no_grad
@@ -77,6 +78,33 @@ def _worker_gradient_chunk(
         results.append((start, stop, grad_slice.cpu()))
 
     return results
+
+
+def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
+                  shift, shots, measure_method, chunk_size, result_queue):
+    """Process worker for multi-GPU gradient computation.
+
+    Each process owns one GPU, avoids GIL contention for sampling-heavy methods.
+    """
+    device = f'cuda:{gpu_id}'
+    circuit_clone = circuit_cpu.to_device(device)
+    base_dev = base_cpu.to(device)
+    results = []
+
+    for start, stop in ranges:
+        C = stop - start
+        idx = torch.arange(start, stop, device=device)
+        arange_C = torch.arange(C, device=device)
+
+        batch = base_dev.expand(2 * C, -1).clone()
+        batch[arange_C, idx] += shift
+        batch[C + arange_C, idx] -= shift
+
+        exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+        grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+        results.append((start, stop, grad_slice.cpu()))
+
+    result_queue.put(results)
 
 
 class BatchParameterShiftGradient(Gradient):
@@ -186,7 +214,7 @@ def batch_gradient(
             exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         elif num_gpus is not None and num_gpus > 1 and P > 0:
-            # --- Multi-GPU path ---
+            # --- Multi-GPU path (multiprocessing to avoid GIL) ---
             # Build chunk ranges
             all_ranges = []
             for start in range(0, P, chunk_size):
@@ -198,34 +226,34 @@ def batch_gradient(
             for idx_r, r in enumerate(all_ranges):
                 gpu_ranges[idx_r % num_gpus].append(r)
 
-            # Create per-GPU circuit clones
-            gpu_circuits = {}
+            # CPU copies for safe cross-process sharing
+            circuit_cpu = circuit.to_device('cpu')
+            base_cpu = base.cpu()
+
+            # Launch worker processes (spawn context for CUDA safety)
+            ctx = mp.get_context('spawn')
+            result_queue = ctx.Queue()
+            processes = []
             for gpu_id in range(num_gpus):
-                if gpu_ranges[gpu_id]:
-                    gpu_circuits[gpu_id] = circuit.to_device(f'cuda:{gpu_id}')
+                if not gpu_ranges[gpu_id]:
+                    continue
+                p = ctx.Process(
+                    target=_mp_worker_fn,
+                    args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
+                          hamiltonian, shift, shots, measure_method,
+                          chunk_size, result_queue),
+                )
+                p.start()
+                processes.append(p)
 
-            # Launch workers via ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=num_gpus) as executor:
-                futures = {}
-                for gpu_id, ranges in gpu_ranges.items():
-                    if not ranges:
-                        continue
-                    futures[executor.submit(
-                        _worker_gradient_chunk,
-                        ranges,
-                        base.cpu(),
-                        gpu_circuits[gpu_id],
-                        hamiltonian,
-                        shift,
-                        shots,
-                        measure_method,
-                        chunk_size,
-                    )] = gpu_id
+            # Collect results
+            for _ in processes:
+                results = result_queue.get()
+                for start, stop, grad_slice_cpu in results:
+                    grad[start:stop] = grad_slice_cpu.to(device)
 
-                for future in as_completed(futures):
-                    results = future.result()
-                    for start, stop, grad_slice_cpu in results:
-                        grad[start:stop] = grad_slice_cpu.to(device)
+            for p in processes:
+                p.join()
         else:
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
