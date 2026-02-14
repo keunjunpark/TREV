@@ -43,6 +43,22 @@ def expectation_value(tensor:torch.Tensor, hamiltonian: Hamiltonian, shots:float
     return ret
 
 
+def _kron_contract_right_4d(Prod, A0, A1, sign=1):
+    """Contract Prod @ E using Kronecker-factored O(chi^5) matmuls.
+
+    E = conj(A0)⊗A0 + sign*conj(A1)⊗A1
+
+    Prod: (chi, chi, chi, chi)  — 4D transfer matrix (non-batched)
+    A0, A1: (chi, chi)          — site matrices
+    """
+    temp0 = torch.matmul(A0.conj().mT, Prod)   # (chi,chi,chi,chi) — contracts bra
+    r0 = torch.matmul(temp0, A0)                 # (chi,chi,chi,chi) — contracts ket
+    temp1 = torch.matmul(A1.conj().mT, Prod)
+    r1 = torch.matmul(temp1, A1)
+    return r0 + sign * r1
+
+
+@torch.no_grad()
 def expectation_value_batch(
     tensors: torch.Tensor,
     hamiltonian,
@@ -50,66 +66,77 @@ def expectation_value_batch(
     chunk_size: int | None = None,
 ) -> torch.Tensor:
     """
-    Batched <psi|H|psi> for a Tensor Ring (periodic MPS), no external helpers.
+    <psi|H|psi> via identity-chain factored Kronecker O(chi^5) contraction.
 
-    tensors[i]: (ℓ_i, r_i, d) with d=2.
-    Hamiltonian API:
-      - get_bool_pauli_tensor() -> Bool tensor (T, N)  (True => apply Z)
-      - coefficients -> iterable length T (real/complex)
+    Precomputes all-identity left-prefix and right-suffix products, then
+    contracts only at the sparse Z-sites of each Hamiltonian term.
 
+    tensors: (N, chi, chi, 2)
     Returns a real scalar tensor.
     """
     device = device or tensors.device
     paulis = hamiltonian.get_bool_pauli_tensor().to(device)   # (T, N)
     if paulis.dim() != 2:
         raise ValueError("Expected paulis shape (T, N)")
-    T, N = paulis.shape
+    Tc, N = paulis.shape
 
-    # Complex coefficients
     coeffs = torch.as_tensor(
         [c.item() if hasattr(c, "item") else c for c in hamiltonian.coefficients],
         dtype=torch.cfloat, device=device,
     )
 
-    # Local ops
-    Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.cfloat, device=device)
-    I = torch.eye(2, dtype=torch.cfloat, device=device)
+    chi = tensors.shape[1]
 
-    # Default: one chunk
-    if chunk_size is None:
-        chunk_size = T
+    # Cache per-site A0, A1 slices
+    sites = []
+    for i in range(N):
+        A = tensors[i].to(device=device, dtype=torch.cfloat)  # (chi, chi, 2)
+        sites.append((A[:, :, 0].contiguous(), A[:, :, 1].contiguous()))
 
+    eye4 = torch.eye(chi * chi, dtype=torch.cfloat, device=device).reshape(chi, chi, chi, chi)
+
+    # Precompute left prefix under all-identity: L_pre[i] = E_I(0) @ ... @ E_I(i-1)
+    L_pre = [None] * (N + 1)
+    acc = eye4
+    for i in range(N):
+        L_pre[i] = acc
+        A0, A1 = sites[i]
+        acc = _kron_contract_right_4d(acc, A0, A1)
+    L_pre[N] = acc
+
+    # Precompute transposed right suffix under all-identity
+    # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T — built from transposed cores
+    # Trace formula: Tr(run @ R_suf[i]) = (run * R_suf_T[i]).sum()
+    R_suf_T = [None] * (N + 1)
+    R_suf_T[N] = eye4
+    acc = eye4
+    for i in range(N - 1, -1, -1):
+        A0, A1 = sites[i]
+        acc = _kron_contract_right_4d(acc, A0.mT, A1.mT)
+        R_suf_T[i] = acc
+
+    # Per-term contraction: only at Z-sites
     total = torch.zeros((), dtype=torch.cfloat, device=device)
 
-    for start in range(0, T, chunk_size):
-        stop = min(start + chunk_size, T)
-        mask = paulis[start:stop]            # (B, N)
-        coefs = coeffs[start:stop]           # (B,)
-        B = mask.size(0)
+    for t in range(Tc):
+        z_sites = torch.where(paulis[t])[0].tolist()
 
-        # Build the first site's batched transfer E0(b,ℓ,ℓ',r,r')
-        A = tensors[0].to(device)            # (ℓ0, r0, d)
-        AO_I = torch.einsum('lrd,dk->lrk', A, I)  # (ℓ0,r0,k)
-        AO_Z = torch.einsum('lrd,dk->lrk', A, Z)  # (ℓ0,r0,k)
-        E_I = torch.tensordot(A.conj(), AO_I, dims=([2],[2])).permute(0,2,1,3)  # (ℓ0,ℓ0',r0,r0')
-        E_Z = torch.tensordot(A.conj(), AO_Z, dims=([2],[2])).permute(0,2,1,3)  # (ℓ0,ℓ0',r0,r0')
-        m0 = mask[:, 0].view(B, 1, 1, 1, 1)
-        ten = torch.where(m0, E_Z.unsqueeze(0), E_I.unsqueeze(0))               # (B,ℓ0,ℓ0',r0,r0')
+        if len(z_sites) == 0:
+            total += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum()
+            continue
 
-        # Chain remaining sites
-        for i in range(1, N):
-            A = tensors[i].to(device)              # (ℓ, r, d)
-            AO_I = torch.einsum('lrd,dk->lrk', A, I)
-            AO_Z = torch.einsum('lrd,dk->lrk', A, Z)
-            Ei_I = torch.tensordot(A.conj(), AO_I, dims=([2],[2])).permute(0,2,1,3)  # (ℓ,ℓ',r,r')
-            Ei_Z = torch.tensordot(A.conj(), AO_Z, dims=([2],[2])).permute(0,2,1,3)
-            mi = mask[:, i].view(B, 1, 1, 1, 1)
-            Ei = torch.where(mi, Ei_Z.unsqueeze(0), Ei_I.unsqueeze(0))               # (B,ℓ,ℓ',r,r')
-            # Contract: ten(b,i,j,p,q) * Ei(b,p,q,r,s) -> (b,i,j,r,s)
-            ten = torch.einsum('bijpq,bpqrs->bijrs', ten, Ei)
+        s_first = z_sites[0]
+        s_last = z_sites[-1]
 
-        # Close ring with double trace over i=r and j=s
-        vals = torch.einsum('bijij->b', ten)   # (B,)
-        total = total + torch.sum(coefs * vals)
+        run = L_pre[s_first].clone()
 
-    return total.real  # scalar
+        for i in range(s_first, s_last + 1):
+            A0, A1 = sites[i]
+            if paulis[t, i]:
+                run = _kron_contract_right_4d(run, A0, A1, sign=-1)
+            else:
+                run = _kron_contract_right_4d(run, A0, A1)
+
+        total += coeffs[t] * (run * R_suf_T[s_last + 1]).sum()
+
+    return total.real
