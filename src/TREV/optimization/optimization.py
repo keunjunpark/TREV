@@ -92,7 +92,7 @@ def minimize(
                     raise NotImplementedError()
             _t_best = time.time() - _t0
 
-            print(f"\n[TREV] Epoch {epoch}: grad={_t_grad:.2f}s, exp_value={_t_exp:.2f}s, best_result={_t_best:.2f}s", flush=True)
+            #print(f"\n[TREV] Epoch {epoch}: grad={_t_grad:.2f}s, exp_value={_t_exp:.2f}s, best_result={_t_best:.2f}s", flush=True)
             progress_bar(epoch, iteration, start, exp_value)
 
             if epoch % 10 == 0:
