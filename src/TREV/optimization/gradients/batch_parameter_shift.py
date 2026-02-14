@@ -87,22 +87,42 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
     Each process owns one GPU, avoids GIL contention for sampling-heavy methods.
     Writes results directly into a pre-allocated shared-memory tensor.
     """
-    device = f'cuda:{gpu_id}'
-    circuit_clone = circuit_cpu.to_device(device)
-    base_dev = base_cpu.to(device)
+    import traceback, time as _time
+    _t0 = _time.perf_counter()
+    try:
+        print(f"[TREV] GPU {gpu_id} worker started, {len(ranges)} chunk(s)", flush=True)
 
-    for start, stop in ranges:
-        C = stop - start
-        idx = torch.arange(start, stop, device=device)
-        arange_C = torch.arange(C, device=device)
+        device = f'cuda:{gpu_id}'
+        circuit_clone = circuit_cpu.to_device(device)
+        print(f"[TREV] GPU {gpu_id} circuit cloned to {device}", flush=True)
 
-        batch = base_dev.expand(2 * C, -1).clone()
-        batch[arange_C, idx] += shift
-        batch[C + arange_C, idx] -= shift
+        base_dev = base_cpu.to(device)
+        print(f"[TREV] GPU {gpu_id} base tensor moved to {device}, shape={base_dev.shape}", flush=True)
 
-        exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
-        grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-        grad_shared[start:stop] = grad_slice.cpu()
+        for chunk_idx, (start, stop) in enumerate(ranges):
+            C = stop - start
+            idx = torch.arange(start, stop, device=device)
+            arange_C = torch.arange(C, device=device)
+
+            batch = base_dev.expand(2 * C, -1).clone()
+            batch[arange_C, idx] += shift
+            batch[C + arange_C, idx] -= shift
+
+            _tc = _time.perf_counter()
+            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+            _dt = _time.perf_counter() - _tc
+
+            grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+            grad_shared[start:stop] = grad_slice.cpu()
+
+            print(f"[TREV] GPU {gpu_id} chunk {chunk_idx+1}/{len(ranges)} "
+                  f"(params {start}:{stop}) done in {_dt:.2f}s", flush=True)
+
+        _total = _time.perf_counter() - _t0
+        print(f"[TREV] GPU {gpu_id} worker DONE — {_total:.2f}s total", flush=True)
+    except Exception as e:
+        print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+        traceback.print_exc()
 
 
 class BatchParameterShiftGradient(Gradient):
@@ -231,6 +251,13 @@ def batch_gradient(
             # Shared-memory tensor: workers write directly, no Queue needed
             grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
 
+            print(f"[TREV] Spawning {num_gpus} workers, P={P}, chunk_size={chunk_size}, "
+                  f"total_chunks={len(all_ranges)}", flush=True)
+            for gpu_id in range(num_gpus):
+                n_ch = len(gpu_ranges[gpu_id])
+                n_p = sum(s[1]-s[0] for s in gpu_ranges[gpu_id])
+                print(f"[TREV]   GPU {gpu_id}: {n_ch} chunks, {n_p} params", flush=True)
+
             # Launch worker processes (spawn context for CUDA safety)
             ctx = mp.get_context('spawn')
             processes = []
@@ -244,14 +271,21 @@ def batch_gradient(
                           chunk_size, grad_shared),
                 )
                 p.start()
+                print(f"[TREV] GPU {gpu_id} process started (PID {p.pid})", flush=True)
                 processes.append(p)
 
             # Wait for all workers to finish
             for p in processes:
                 p.join()
 
+            # Check for crashed workers
+            for p in processes:
+                if p.exitcode != 0:
+                    print(f"[TREV] WARNING: Worker PID {p.pid} exited with code {p.exitcode}", flush=True)
+
             # Copy shared result to device
             grad[:] = grad_shared.to(device)
+            print(f"[TREV] All workers done, grad copied to {device}", flush=True)
         else:
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
