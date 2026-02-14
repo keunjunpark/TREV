@@ -170,6 +170,9 @@ class _MultiGPUPool:
         # Update shared base tensor
         self.base_shared[:P] = params.detach().cpu()
 
+        # Free main-process GPU cache so GPU 0 worker has room
+        torch.cuda.empty_cache()
+
         # Build chunk ranges and round-robin assign
         all_ranges = []
         for start in range(0, P, chunk_size):
@@ -262,6 +265,8 @@ class BatchParameterShiftGradient(Gradient):
         # Use persistent pool for multi-GPU (avoids spawn overhead each iteration)
         if self._num_gpus > 1 and not self.is_partial:
             if self._gpu_pool is None:
+                # Free main-process GPU cache so workers have room (especially GPU 0)
+                torch.cuda.empty_cache()
                 self._gpu_pool = _MultiGPUPool(
                     self._num_gpus, circuit, hamiltonian,
                     self.shift, self.shots, self.measure_method,

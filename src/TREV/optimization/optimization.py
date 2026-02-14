@@ -45,18 +45,23 @@ def minimize(
             it_time = time.time()
             optim.zero_grad()
 
+            _t0 = time.time()
             grad = gradient.run(theta, circuit, hamiltonian)
             theta.grad = grad
             optim.step()
             if circuit.device == 'cuda':
                 torch.cuda.synchronize()
+            _t_grad = time.time() - _t0
             iteration_times.append(time.time() - it_time)
 
             # --- expectation value ---
+            _t0 = time.time()
             exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
+            _t_exp = time.time() - _t0
             exp_values.append(exp_value)
 
             # --- best result method ---
+            _t0 = time.time()
             if best_value_method == 'highest_probability':
                 best_result.append(
                     get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
@@ -85,7 +90,9 @@ def minimize(
                     )
                 else:
                     raise NotImplementedError()
+            _t_best = time.time() - _t0
 
+            print(f"\n[TREV] Epoch {epoch}: grad={_t_grad:.2f}s, exp_value={_t_exp:.2f}s, best_result={_t_best:.2f}s", flush=True)
             progress_bar(epoch, iteration, start, exp_value)
 
             if epoch % 10 == 0:
