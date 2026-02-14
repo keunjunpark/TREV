@@ -80,49 +80,124 @@ def _worker_gradient_chunk(
     return results
 
 
-def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
-                  shift, shots, measure_method, chunk_size, grad_shared):
-    """Process worker for multi-GPU gradient computation.
+def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
+                          measure_method, chunk_size,
+                          base_shared, grad_shared, ranges_queue, done_barrier,
+                          shutdown_event):
+    """Persistent process worker — stays alive across iterations.
 
-    Each process owns one GPU, avoids GIL contention for sampling-heavy methods.
-    Writes results directly into a pre-allocated shared-memory tensor.
+    Waits for work on ranges_queue, computes, writes to grad_shared,
+    then syncs at done_barrier. Loops until shutdown_event is set.
     """
-    import traceback, time as _time
-    _t0 = _time.perf_counter()
-    try:
-        print(f"[TREV] GPU {gpu_id} worker started, {len(ranges)} chunk(s)", flush=True)
+    import traceback
+    device = f'cuda:{gpu_id}'
+    circuit_clone = circuit_cpu.to_device(device)
 
-        device = f'cuda:{gpu_id}'
-        circuit_clone = circuit_cpu.to_device(device)
-        print(f"[TREV] GPU {gpu_id} circuit cloned to {device}", flush=True)
+    while not shutdown_event.is_set():
+        # Wait for work (ranges list) or shutdown sentinel
+        try:
+            msg = ranges_queue.get(timeout=1.0)
+        except Exception:
+            continue
+        if msg is None:  # shutdown sentinel
+            break
 
-        base_dev = base_cpu.to(device)
-        print(f"[TREV] GPU {gpu_id} base tensor moved to {device}, shape={base_dev.shape}", flush=True)
+        ranges = msg
+        try:
+            P = base_shared.shape[0]
+            base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
 
-        for chunk_idx, (start, stop) in enumerate(ranges):
-            C = stop - start
-            idx = torch.arange(start, stop, device=device)
-            arange_C = torch.arange(C, device=device)
+            for start, stop in ranges:
+                C = stop - start
+                idx = torch.arange(start, stop, device=device)
+                arange_C = torch.arange(C, device=device)
 
-            batch = base_dev.expand(2 * C, -1).clone()
-            batch[arange_C, idx] += shift
-            batch[C + arange_C, idx] -= shift
+                batch = base_dev.expand(2 * C, -1).clone()
+                batch[arange_C, idx] += shift
+                batch[C + arange_C, idx] -= shift
 
-            _tc = _time.perf_counter()
-            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
-            _dt = _time.perf_counter() - _tc
+                exp_vals = _dispatch_expectation(
+                    batch, circuit_clone, hamiltonian, shots, measure_method)
+                grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                grad_shared[start:stop] = grad_slice.cpu()
+        except Exception as e:
+            print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+            traceback.print_exc()
 
-            grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-            grad_shared[start:stop] = grad_slice.cpu()
+        # Signal this worker is done for this iteration
+        done_barrier.wait()
 
-            print(f"[TREV] GPU {gpu_id} chunk {chunk_idx+1}/{len(ranges)} "
-                  f"(params {start}:{stop}) done in {_dt:.2f}s", flush=True)
 
-        _total = _time.perf_counter() - _t0
-        print(f"[TREV] GPU {gpu_id} worker DONE — {_total:.2f}s total", flush=True)
-    except Exception as e:
-        print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
-        traceback.print_exc()
+class _MultiGPUPool:
+    """Persistent pool of worker processes for multi-GPU gradient computation."""
+
+    def __init__(self, num_gpus, circuit, hamiltonian, shift, shots,
+                 measure_method, chunk_size, P):
+        ctx = mp.get_context('spawn')
+
+        circuit_cpu = circuit.to_device('cpu')
+        self.num_gpus = num_gpus
+        self.P = P
+
+        # Shared-memory tensors for data exchange (no Queue serialization)
+        self.base_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+        self.grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+
+        # Per-worker queue for sending ranges
+        self.ranges_queues = [ctx.Queue() for _ in range(num_gpus)]
+        # Barrier: num_gpus workers + 1 main thread
+        self.done_barrier = ctx.Barrier(num_gpus + 1)
+        self.shutdown_event = ctx.Event()
+
+        self.processes = []
+        for gpu_id in range(num_gpus):
+            p = ctx.Process(
+                target=_persistent_worker_fn,
+                args=(gpu_id, circuit_cpu, hamiltonian, shift, shots,
+                      measure_method, chunk_size,
+                      self.base_shared, self.grad_shared,
+                      self.ranges_queues[gpu_id], self.done_barrier,
+                      self.shutdown_event),
+            )
+            p.daemon = True
+            p.start()
+            self.processes.append(p)
+        print(f"[TREV] Persistent multi-GPU pool started: {num_gpus} workers", flush=True)
+
+    def compute_gradient(self, params, chunk_size, device):
+        P = params.numel()
+
+        # Update shared base tensor
+        self.base_shared[:P] = params.detach().cpu()
+
+        # Build chunk ranges and round-robin assign
+        all_ranges = []
+        for start in range(0, P, chunk_size):
+            stop = min(start + chunk_size, P)
+            all_ranges.append((start, stop))
+
+        gpu_ranges = {i: [] for i in range(self.num_gpus)}
+        for idx_r, r in enumerate(all_ranges):
+            gpu_ranges[idx_r % self.num_gpus].append(r)
+
+        # Send work to each worker
+        for gpu_id in range(self.num_gpus):
+            self.ranges_queues[gpu_id].put(gpu_ranges[gpu_id])
+
+        # Wait for all workers to finish
+        self.done_barrier.wait()
+
+        # Copy result to device
+        return self.grad_shared[:P].to(device).clone()
+
+    def shutdown(self):
+        self.shutdown_event.set()
+        for q in self.ranges_queues:
+            q.put(None)  # sentinel
+        for p in self.processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
 
 
 class BatchParameterShiftGradient(Gradient):
@@ -141,6 +216,8 @@ class BatchParameterShiftGradient(Gradient):
             self._num_gpus = _get_gpu_count()
         else:
             self._num_gpus = num_gpus
+
+        self._gpu_pool = None  # lazy-initialized persistent pool
 
         # optional: control printing via env var
         self._verbose = True
@@ -182,9 +259,20 @@ class BatchParameterShiftGradient(Gradient):
                     gpu_msg += f"\n[TREV] Multi-GPU enabled: {self._num_gpus} GPUs"
                 print(gpu_msg + "\n", flush=True)
 
-        val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
-                             self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
-                             num_gpus=self._num_gpus)
+        # Use persistent pool for multi-GPU (avoids spawn overhead each iteration)
+        if self._num_gpus > 1 and not self.is_partial:
+            if self._gpu_pool is None:
+                self._gpu_pool = _MultiGPUPool(
+                    self._num_gpus, circuit, hamiltonian,
+                    self.shift, self.shots, self.measure_method,
+                    self.batch_size, theta.numel(),
+                )
+            device = circuit.device
+            val = self._gpu_pool.compute_gradient(theta, self.batch_size, device)
+        else:
+            val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
+                                 self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
+                                 num_gpus=1)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
 
