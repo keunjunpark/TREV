@@ -62,8 +62,12 @@ def expectation_value(
     # Cast once
     Es    = [(E0.to(cdtype), E1.to(cdtype)) for (E0,E1) in Es]
     R_suf = [Ri.to(cdtype) for Ri in R_suf]
-    # Prep per-site R4 with detected permutation
-    R4 = [ R_suf[i].view(chi,chi,chi,chi).permute(2,3,0,1).contiguous() for i in range(n) ]
+    chi2 = chi * chi
+    # Convert R_suf to bilinear form: R_bl such that w = vec(M)† @ R_bl @ vec(M)
+    R_bl = [R_suf[i].view(chi,chi,chi,chi).permute(3,1,2,0)
+                     .contiguous().reshape(chi2, chi2)
+            for i in range(n)]
+    del R_suf
     # Single-layer slices
     A0 = [cores[i][:,:,0].to(cdtype).contiguous() for i in range(n)]
     A1 = [cores[i][:,:,1].to(cdtype).contiguous() for i in range(n)]
@@ -87,9 +91,14 @@ def expectation_value(
 
             M0 = X @ A0[i];  M1 = X @ A1[i]
 
-
-            w0 = torch.einsum('sab,scd,acbd->s', M0, M0.conj(), R4[i]).real
-            w1 = torch.einsum('sab,scd,acbd->s', M1, M1.conj(), R4[i]).real
+            # Bilinear form: w = vec(M)† @ R_bl @ vec(M), O(S * chi^4) no big intermediate
+            Ri = R_bl[i]                              # (chi2, chi2)
+            v0 = M0.reshape(B, chi2)                  # (S, chi2)
+            v1 = M1.reshape(B, chi2)
+            y0 = torch.matmul(v0, Ri.mT)             # (S, chi2)
+            y1 = torch.matmul(v1, Ri.mT)
+            w0 = (v0.conj() * y0).sum(-1).real        # (S,)
+            w1 = (v1.conj() * y1).sum(-1).real
 
             den = (w0 + w1).clamp_min(1e-300)
             p0  = (w0 / den).to(torch.float64)
