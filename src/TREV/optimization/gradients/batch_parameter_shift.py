@@ -81,18 +81,15 @@ def _worker_gradient_chunk(
 
 
 def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
-                  shift, shots, measure_method, chunk_size, result_queue,
-                  done_event):
+                  shift, shots, measure_method, chunk_size, grad_shared):
     """Process worker for multi-GPU gradient computation.
 
     Each process owns one GPU, avoids GIL contention for sampling-heavy methods.
-    Must stay alive until parent signals done_event, so FD-based tensor sharing
-    completes before the resource sharer shuts down.
+    Writes results directly into a pre-allocated shared-memory tensor.
     """
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
     base_dev = base_cpu.to(device)
-    results = []
 
     for start, stop in ranges:
         C = stop - start
@@ -105,10 +102,7 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian,
 
         exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
         grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-        results.append((start, stop, grad_slice.cpu()))
-
-    result_queue.put(results)
-    done_event.wait()  # stay alive until parent has consumed all results
+        grad_shared[start:stop] = grad_slice.cpu()
 
 
 class BatchParameterShiftGradient(Gradient):
@@ -234,10 +228,11 @@ def batch_gradient(
             circuit_cpu = circuit.to_device('cpu')
             base_cpu = base.cpu()
 
+            # Shared-memory tensor: workers write directly, no Queue needed
+            grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+
             # Launch worker processes (spawn context for CUDA safety)
             ctx = mp.get_context('spawn')
-            result_queue = ctx.Queue()
-            done_event = ctx.Event()
             processes = []
             for gpu_id in range(num_gpus):
                 if not gpu_ranges[gpu_id]:
@@ -246,21 +241,17 @@ def batch_gradient(
                     target=_mp_worker_fn,
                     args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
                           hamiltonian, shift, shots, measure_method,
-                          chunk_size, result_queue, done_event),
+                          chunk_size, grad_shared),
                 )
                 p.start()
                 processes.append(p)
 
-            # Collect results
-            for _ in processes:
-                results = result_queue.get()
-                for start, stop, grad_slice_cpu in results:
-                    grad[start:stop] = grad_slice_cpu.to(device)
-
-            # Signal children they can exit, then join
-            done_event.set()
+            # Wait for all workers to finish
             for p in processes:
                 p.join()
+
+            # Copy shared result to device
+            grad[:] = grad_shared.to(device)
         else:
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
