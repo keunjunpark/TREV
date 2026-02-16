@@ -2,7 +2,7 @@ from typing import Optional, List
 
 import torch
 
-from ..hamiltonian.hamiltonian import Hamiltonian
+from ..hamiltonian.hamiltonian import Hamiltonian, rotate_tensor_for_measurement
 def kron(A, B):  # alias
     return torch.kron(A, B)
 
@@ -54,74 +54,91 @@ def precompute_double_layer_and_right_suffix(cores):
 def expectation_value(
     cores, hamiltonian, shots=10_000, chunk_size=128, term_chunk=4096, seed=None
 ):
-    # Build in the *same* basis as your working code
-    Es, R_suf, d2, device, _ = precompute_double_layer_and_right_suffix(cores)
-    cdtype = cores[0].dtype           # keep dtype consistent with cores
-    n, chi = len(Es), int(d2**0.5)
+    groups = hamiltonian.get_qwc_groups()
+    op_tensor = hamiltonian.get_pauli_op_tensor().to(cores[0].device)  # (T, N) uint8
+    all_coeffs = hamiltonian.coefficients
+    n = len(cores)
+    shots_per_group = max(1, shots // len(groups))
+    device = cores[0].device
+    cdtype = cores[0].dtype
 
-    # Cast once
-    Es    = [(E0.to(cdtype), E1.to(cdtype)) for (E0,E1) in Es]
-    R_suf = [Ri.to(cdtype) for Ri in R_suf]
-    chi2 = chi * chi
-    # Convert R_suf to bilinear form: R_bl such that w = vec(M)† @ R_bl @ vec(M)
-    R_bl = [R_suf[i].view(chi,chi,chi,chi).permute(3,1,2,0)
-                     .contiguous().reshape(chi2, chi2)
-            for i in range(n)]
-    del R_suf
-    # Single-layer slices
-    A0 = [cores[i][:,:,0].to(cdtype).contiguous() for i in range(n)]
-    A1 = [cores[i][:,:,1].to(cdtype).contiguous() for i in range(n)]
-
-    # H (streaming; no (B×T) buffer)
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=torch.float64, device=device)
-    zmask  = hamiltonian.get_bool_pauli_tensor().to(device=device, dtype=torch.bool)
-    T = int(coeffs.numel())
+    # Stack cores into tensor for rotation
+    tensor = torch.stack(cores, dim=0)  # (N, chi, chi, 2)
 
     # RNG
     gen = torch.Generator(device=device)
-    if seed is not None: gen.manual_seed(seed)
+    if seed is not None:
+        gen.manual_seed(seed)
 
-    total = torch.zeros((), dtype=torch.float64, device=device); done = 0
-    for s0 in range(0, shots, chunk_size):
-        s1 = min(s0 + chunk_size, shots); B = s1 - s0
-        X    = torch.eye(chi, dtype=cdtype, device=device).expand(B,chi,chi).clone()
-        bits = torch.empty((B,n), dtype=torch.bool, device=device)
+    grand_total = 0.0
 
-        for i in range(n):
+    for group in groups:
+        idx = group['term_indices']
 
-            M0 = X @ A0[i];  M1 = X @ A1[i]
+        # Rotate cores for this group's measurement basis
+        rotated = rotate_tensor_for_measurement(tensor, group['basis'])
+        rot_cores = [rotated[i] for i in range(n)]
 
-            # Bilinear form: w = vec(M)† @ R_bl @ vec(M), O(S * chi^4) no big intermediate
-            Ri = R_bl[i]                              # (chi2, chi2)
-            v0 = M0.reshape(B, chi2)                  # (S, chi2)
-            v1 = M1.reshape(B, chi2)
-            y0 = torch.matmul(v0, Ri.mT)             # (S, chi2)
-            y1 = torch.matmul(v1, Ri.mT)
-            w0 = (v0.conj() * y0).sum(-1).real        # (S,)
-            w1 = (v1.conj() * y1).sum(-1).real
+        # Non-I mask and coefficients for this group's terms
+        group_nonI = (op_tensor[idx] != 0).to(device=device, dtype=torch.bool)  # (G, N)
+        group_coeffs = torch.tensor(
+            [all_coeffs[t] for t in idx], dtype=torch.float64, device=device
+        )
 
-            den = (w0 + w1).clamp_min(1e-300)
-            p0  = (w0 / den).to(torch.float64)
-            si  = (torch.rand((B,), generator=gen, device=device) >= p0)
-            bits[:, i] = si
-            X = torch.where(si.view(B,1,1), M1, M0)
+        # Precompute double layer and right suffix for rotated cores
+        Es, R_suf, d2, _, _ = precompute_double_layer_and_right_suffix(rot_cores)
+        chi = int(d2**0.5)
+        chi2 = chi * chi
 
-            # if (i % 8) == 0 and i != 0:
-            nX = torch.linalg.norm(X.reshape(B,-1), dim=1).clamp_min(1e-300).view(B,1,1)
-            #X  = X / nX
+        Es = [(E0.to(cdtype), E1.to(cdtype)) for (E0, E1) in Es]
+        R_suf_cast = [Ri.to(cdtype) for Ri in R_suf]
+        R_bl = [R_suf_cast[i].view(chi, chi, chi, chi).permute(3, 1, 2, 0)
+                .contiguous().reshape(chi2, chi2)
+                for i in range(n)]
+        del R_suf, R_suf_cast
 
-        # stream scoring
-        Eb = torch.zeros((B,), dtype=torch.float64, device=device)
-        bf = bits.to(torch.float32)
-        for t0 in range(0, T, term_chunk):
-            t1 = min(t0 + term_chunk, T)
-            Zblk = zmask[t0:t1, :]; Cblk = coeffs[t0:t1]
-            cnt = bf @ Zblk.to(torch.float32).T
+        A0 = [rot_cores[i][:, :, 0].to(cdtype).contiguous() for i in range(n)]
+        A1 = [rot_cores[i][:, :, 1].to(cdtype).contiguous() for i in range(n)]
+
+        total = torch.zeros((), dtype=torch.float64, device=device)
+        done = 0
+
+        for s0 in range(0, shots_per_group, chunk_size):
+            s1 = min(s0 + chunk_size, shots_per_group)
+            B = s1 - s0
+            X = torch.eye(chi, dtype=cdtype, device=device).expand(B, chi, chi).clone()
+            bits = torch.empty((B, n), dtype=torch.bool, device=device)
+
+            for i in range(n):
+                M0 = X @ A0[i]; M1 = X @ A1[i]
+
+                Ri = R_bl[i]
+                v0 = M0.reshape(B, chi2)
+                v1 = M1.reshape(B, chi2)
+                y0 = torch.matmul(v0, Ri.mT)
+                y1 = torch.matmul(v1, Ri.mT)
+                w0 = (v0.conj() * y0).sum(-1).real
+                w1 = (v1.conj() * y1).sum(-1).real
+
+                den = (w0 + w1).clamp_min(1e-300)
+                p0 = (w0 / den).to(torch.float64)
+                si = (torch.rand((B,), generator=gen, device=device) >= p0)
+                bits[:, i] = si
+                X = torch.where(si.view(B, 1, 1), M1, M0)
+
+                nX = torch.linalg.norm(X.reshape(B, -1), dim=1).clamp_min(1e-300).view(B, 1, 1)
+
+            # Score using non-I mask for this group
+            bf = bits.to(torch.float32)
+            cnt = bf @ group_nonI.to(torch.float32).T  # (B, G)
             sgn = torch.where((cnt.remainder_(2.0) > 0.5), -1.0, 1.0).to(torch.float64)
-            Eb += sgn @ Cblk
-        total += Eb.sum(); done += B
+            Eb = sgn @ group_coeffs  # (B,)
+            total += Eb.sum()
+            done += B
 
-    return (total / max(1, done)).item()
+        grand_total += (total / max(1, done)).item()
+
+    return grand_total
 
 
 @torch.no_grad()
