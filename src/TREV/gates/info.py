@@ -33,6 +33,7 @@ def H(batch_size=None, device:str=None):
         return (1 / math.sqrt(2)) * torch.tensor([[1, 1], [1, -1]], dtype=torch.cfloat).expand(batch_size,2,2).to(device)
 
 def RX(theta, device:str=None):  # theta can be scalar or batch
+    is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
     theta = torch.atleast_1d(theta)
     cos = torch.cos(theta / 2)
     sin = torch.sin(theta / 2)
@@ -40,9 +41,10 @@ def RX(theta, device:str=None):  # theta can be scalar or batch
         torch.stack([cos, -1j * sin], dim=-1),
         torch.stack([-1j * sin, cos], dim=-1)
     ], dim=-2).to(device).type(torch.cfloat)
-    return rx if len(theta) > 1 else rx[0]
+    return rx[0] if is_scalar else rx
 
 def RY(theta, device:str=None):
+    is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
     theta = torch.atleast_1d(theta)
     cos = torch.cos(theta / 2)
     sin = torch.sin(theta / 2)
@@ -50,9 +52,10 @@ def RY(theta, device:str=None):
         torch.stack([cos, -sin], dim=-1),
         torch.stack([sin,  cos], dim=-1)
     ], dim=-2).type(torch.cfloat).to(device)
-    return ry if len(theta) > 1 else ry[0]
+    return ry[0] if is_scalar else ry
 
 def RZ(theta, device:str=None):
+    is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
     theta = torch.atleast_1d(theta)
     exp_m = torch.exp(-1j * theta / 2)
     exp_p = torch.exp(1j * theta / 2)
@@ -60,7 +63,7 @@ def RZ(theta, device:str=None):
         torch.stack([exp_m, torch.zeros_like(theta)], dim=-1),
         torch.stack([torch.zeros_like(theta), exp_p], dim=-1)
     ], dim=-2).to(device).type(torch.cfloat)
-    return rz if len(theta) > 1 else rz[0]
+    return rz[0] if is_scalar else rz
 
 def SWAP(device:str=None):
     return torch.tensor([
