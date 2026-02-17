@@ -65,7 +65,7 @@ def RZ(theta, device:str=None):
     ], dim=-2).to(device).type(torch.cfloat)
     return rz[0] if is_scalar else rz
 
-def SWAP(device:str=None):
+def SWAP(batch_size=None, device:str=None):
     return torch.tensor([
         [1, 0, 0, 0],
         [0, 0, 1, 0],
