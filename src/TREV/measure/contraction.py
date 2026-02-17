@@ -52,6 +52,37 @@ def contract_tensor_ring(psi: torch.Tensor) -> torch.Tensor:
     psi_new = torch.tensordot(psi_new, psi[-1], dims=([0, 1], [1, 0]))
     return psi_new                   # shape (2, 2, …, 2)
 
+
+def contract_mps(psi: torch.Tensor) -> torch.Tensor:
+    """
+    Open-boundary MPS contraction.
+    psi  : (N, χ, χ, 2)
+    return: (2,)*N
+
+    Same as contract_tensor_ring but picks boundary index 0
+    instead of tracing over the periodic bond.
+    """
+    N = psi.shape[0]
+
+    if N == 1:
+        return psi[0][0, 0, :]           # (2,)
+
+    # Start: select left boundary index 0 → (χ_right, 2)
+    psi_new = psi[0][0, :, :]            # (χ, 2)
+
+    for i in range(1, N - 1):
+        # psi_new: (χ, 2, ..., 2) with right bond at dim 0
+        # psi[i]:  (χ_left, χ_right, 2)
+        psi_new = torch.tensordot(psi_new, psi[i], dims=([0], [0]))
+        # move new right bond (second-to-last dim) back to position 0
+        psi_new = torch.movedim(psi_new, -2, 0)
+
+    # End: select right boundary index 0 from last site
+    last = psi[-1][:, 0, :]              # (χ_left, 2)
+    psi_new = torch.tensordot(psi_new, last, dims=([0], [0]))
+    return psi_new                        # (2, 2, ..., 2)
+
+
 def measure(ring_tensors: torch.Tensor) -> Tensor:
     """
     ring_tensors : (N, χ1, χ2, 2)
