@@ -53,40 +53,56 @@ def _get_gpu_count() -> int:
     return torch.cuda.device_count()
 
 
-def _worker_gradient_chunk(
-    ranges: list,
-    base: Tensor,
-    circuit_clone: Circuit,
-    hamiltonian: Hamiltonian,
-    shift: float,
-    shots: int,
-    measure_method: MeasureMethod,
-    chunk_size: int,
-) -> list:
-    """Compute gradient slices for assigned parameter index ranges on one GPU.
+def _distribute_params_evenly(P, num_gpus, chunk_size):
+    """Divide P parameters evenly across num_gpus, each split into chunks.
 
-    Each range is a (start, stop) tuple of parameter indices.
-    Returns a list of (start, stop, grad_slice_cpu) tuples.
+    Returns dict mapping gpu_id -> list of (start, stop) tuples.
     """
-    device = circuit_clone.device
-    P = base.shape[1]
-    base_dev = base.to(device)
-    results = []
+    base_per_gpu = P // num_gpus
+    remainder = P % num_gpus
+    gpu_ranges = {}
+    offset = 0
+    for gpu_id in range(num_gpus):
+        count = base_per_gpu + (1 if gpu_id < remainder else 0)
+        if count == 0:
+            gpu_ranges[gpu_id] = []
+            continue
+        gpu_end = offset + count
+        ranges = []
+        for s in range(offset, gpu_end, chunk_size):
+            ranges.append((s, min(s + chunk_size, gpu_end)))
+        gpu_ranges[gpu_id] = ranges
+        offset = gpu_end
+    return gpu_ranges
 
-    for start, stop in ranges:
-        C = stop - start
-        idx = torch.arange(start, stop, device=device)
-        arange_C = torch.arange(C, device=device)
 
-        batch = base_dev.expand(2 * C, -1).clone()
-        batch[arange_C, idx] += shift
-        batch[C + arange_C, idx] -= shift
+def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, shots,
+                  measure_method, chunk_size, grad_shared):
+    """Multiprocessing worker: compute gradient slices on assigned GPU."""
+    import traceback
+    device = f'cuda:{gpu_id}'
+    circuit_clone = circuit_cpu.to_device(device)
+    base_dev = base_cpu.to(device)
 
-        exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
-        grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-        results.append((start, stop, grad_slice.cpu()))
+    try:
+        for start, stop in ranges:
+            C = stop - start
+            idx = torch.arange(start, stop, device=device)
+            arange_C = torch.arange(C, device=device)
 
-    return results
+            batch = base_dev.expand(2 * C, -1).clone()
+            batch[arange_C, idx] += shift
+            batch[C + arange_C, idx] -= shift
+
+            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+            grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+            grad_shared[start:stop] = grad_slice.cpu()
+    except Exception as e:
+        print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+        traceback.print_exc()
+    finally:
+        del circuit_clone, base_dev
+        torch.cuda.empty_cache()
 
 
 def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
@@ -102,42 +118,47 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
 
-    while not shutdown_event.is_set():
-        # Wait for work (ranges list) or shutdown sentinel
-        try:
-            msg = ranges_queue.get(timeout=1.0)
-        except Exception:
-            continue
-        if msg is None:  # shutdown sentinel
-            break
+    try:
+        while not shutdown_event.is_set():
+            # Wait for work (ranges list) or shutdown sentinel
+            try:
+                msg = ranges_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            if msg is None:  # shutdown sentinel
+                break
 
-        ranges = msg
-        try:
-            P = base_shared.shape[0]
-            base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
+            ranges = msg
+            try:
+                P = base_shared.shape[0]
+                base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
 
-            for start, stop in ranges:
-                C = stop - start
-                idx = torch.arange(start, stop, device=device)
-                arange_C = torch.arange(C, device=device)
+                for start, stop in ranges:
+                    C = stop - start
+                    idx = torch.arange(start, stop, device=device)
+                    arange_C = torch.arange(C, device=device)
 
-                batch = base_dev.expand(2 * C, -1).clone()
-                batch[arange_C, idx] += shift
-                batch[C + arange_C, idx] -= shift
+                    batch = base_dev.expand(2 * C, -1).clone()
+                    batch[arange_C, idx] += shift
+                    batch[C + arange_C, idx] -= shift
 
-                exp_vals = _dispatch_expectation(
-                    batch, circuit_clone, hamiltonian, shots, measure_method)
-                grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                grad_shared[start:stop] = grad_slice.cpu()
-        except Exception as e:
-            print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
-            traceback.print_exc()
+                    exp_vals = _dispatch_expectation(
+                        batch, circuit_clone, hamiltonian, shots, measure_method)
+                    grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                    grad_shared[start:stop] = grad_slice.cpu()
+            except Exception as e:
+                print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+                traceback.print_exc()
 
-        # Release cached GPU memory before going idle
+            # Release cached GPU memory before going idle
+            torch.cuda.empty_cache()
+
+            # Signal this worker is done for this iteration
+            done_barrier.wait()
+    finally:
+        # Cleanup GPU memory on exit
+        del circuit_clone
         torch.cuda.empty_cache()
-
-        # Signal this worker is done for this iteration
-        done_barrier.wait()
 
 
 class _MultiGPUPool:
@@ -193,15 +214,8 @@ class _MultiGPUPool:
         # Free main-process GPU cache so GPU 0 worker has room
         torch.cuda.empty_cache()
 
-        # Build chunk ranges and round-robin assign
-        all_ranges = []
-        for start in range(0, P, chunk_size):
-            stop = min(start + chunk_size, P)
-            all_ranges.append((start, stop))
-
-        gpu_ranges = {i: [] for i in range(self.num_gpus)}
-        for idx_r, r in enumerate(all_ranges):
-            gpu_ranges[idx_r % self.num_gpus].append(r)
+        # Distribute parameters evenly across GPUs
+        gpu_ranges = _distribute_params_evenly(P, self.num_gpus, chunk_size)
 
         # Send work to each worker
         for gpu_id in range(self.num_gpus):
@@ -218,11 +232,19 @@ class _MultiGPUPool:
             _MultiGPUPool._active_pool = None
         self.shutdown_event.set()
         for q in self.ranges_queues:
-            q.put(None)  # sentinel
+            try:
+                q.put(None)  # sentinel
+            except Exception:
+                pass
         for p in self.processes:
-            p.join(timeout=5)
+            p.join(timeout=10)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=5)
+        self.processes.clear()
+        # Release any remaining GPU cache in the main process
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def __del__(self):
         self.shutdown()
@@ -356,16 +378,8 @@ def batch_gradient(
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         elif num_gpus is not None and num_gpus > 1 and P > 0:
             # --- Multi-GPU path (multiprocessing to avoid GIL) ---
-            # Build chunk ranges
-            all_ranges = []
-            for start in range(0, P, chunk_size):
-                stop = min(start + chunk_size, P)
-                all_ranges.append((start, stop))
-
-            # Round-robin assign chunks to GPUs
-            gpu_ranges: dict[int, list] = {i: [] for i in range(num_gpus)}
-            for idx_r, r in enumerate(all_ranges):
-                gpu_ranges[idx_r % num_gpus].append(r)
+            # Distribute parameters evenly across GPUs
+            gpu_ranges = _distribute_params_evenly(P, num_gpus, chunk_size)
 
             # CPU copies for safe cross-process sharing
             circuit_cpu = circuit.to_device('cpu')
@@ -374,8 +388,9 @@ def batch_gradient(
             # Shared-memory tensor: workers write directly, no Queue needed
             grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
 
+            total_chunks = sum(len(v) for v in gpu_ranges.values())
             print(f"[TREV] Spawning {num_gpus} workers, P={P}, chunk_size={chunk_size}, "
-                  f"total_chunks={len(all_ranges)}", flush=True)
+                  f"total_chunks={total_chunks}", flush=True)
             for gpu_id in range(num_gpus):
                 n_ch = len(gpu_ranges[gpu_id])
                 n_p = sum(s[1]-s[0] for s in gpu_ranges[gpu_id])
@@ -408,6 +423,8 @@ def batch_gradient(
 
             # Copy shared result to device
             grad[:] = grad_shared.to(device)
+            # Release main process GPU cache
+            torch.cuda.empty_cache()
             print(f"[TREV] All workers done, grad copied to {device}", flush=True)
         else:
             for start in range(0, P, chunk_size):
