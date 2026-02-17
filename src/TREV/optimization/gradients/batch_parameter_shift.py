@@ -211,6 +211,9 @@ class _MultiGPUPool:
             if p.is_alive():
                 p.terminate()
 
+    def __del__(self):
+        self.shutdown()
+
 
 class BatchParameterShiftGradient(Gradient):
     def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False, num_gpus: int | None = None):
@@ -289,6 +292,11 @@ class BatchParameterShiftGradient(Gradient):
                                  num_gpus=1)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
+
+    def __del__(self):
+        if self._gpu_pool is not None:
+            self._gpu_pool.shutdown()
+            self._gpu_pool = None
 
 
 def batch_gradient(
