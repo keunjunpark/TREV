@@ -143,8 +143,16 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
 class _MultiGPUPool:
     """Persistent pool of worker processes for multi-GPU gradient computation."""
 
+    _active_pool = None  # class-level singleton — only one pool at a time
+
     def __init__(self, num_gpus, circuit, hamiltonian, shift, shots,
                  measure_method, chunk_size, P):
+        # Kill any previous pool first (e.g. from a different gradient object)
+        if _MultiGPUPool._active_pool is not None:
+            print("[TREV] Shutting down previous multi-GPU pool", flush=True)
+            _MultiGPUPool._active_pool.shutdown()
+        _MultiGPUPool._active_pool = self
+
         ctx = mp.get_context('spawn')
 
         circuit_cpu = circuit.to_device('cpu')
@@ -206,6 +214,8 @@ class _MultiGPUPool:
         return self.grad_shared[:P].to(device).clone()
 
     def shutdown(self):
+        if _MultiGPUPool._active_pool is self:
+            _MultiGPUPool._active_pool = None
         self.shutdown_event.set()
         for q in self.ranges_queues:
             q.put(None)  # sentinel
