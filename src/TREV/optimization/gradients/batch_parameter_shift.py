@@ -133,6 +133,9 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
             print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
             traceback.print_exc()
 
+        # Release cached GPU memory before going idle
+        torch.cuda.empty_cache()
+
         # Signal this worker is done for this iteration
         done_barrier.wait()
 

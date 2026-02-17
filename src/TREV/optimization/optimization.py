@@ -106,6 +106,11 @@ def minimize(
                     print(f"[INFO] Early stop at epoch {epoch} due to wall-clock cap ({elapsed:.2f}s ≥ {wall_clock_cap:.2f}s)")
                     break
 
+        # Shut down persistent multi-GPU workers so they release GPU memory
+        if hasattr(gradient, '_gpu_pool') and gradient._gpu_pool is not None:
+            gradient._gpu_pool.shutdown()
+            gradient._gpu_pool = None
+
         return theta, exp_values, best_result, iteration_times
 
 def progress_bar(current, total, start_time, loss=None, bar_len=30):
