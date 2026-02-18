@@ -42,6 +42,8 @@ def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_meth
         return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots)
     elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
         return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots)
+    elif measure_method == MeasureMethod.PERFECT_SAMPLING:
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
     else:
         return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
 
