@@ -106,14 +106,20 @@ class Circuit(torch.nn.Module):
             raise NotImplementedError()
 
     def get_expectation_value(self, theta: Tensor, hamiltonian:Hamiltonian, method: MeasureMethod, shots:int= int(1e4)):
-        tensor = self.build_tensor(theta)
-        if method == MeasureMethod.FULL_CONTRACTION:
-            return contraction.expectation_value(tensor,hamiltonian, device=self.device).real
-        elif method == MeasureMethod.PERFECT_SAMPLING:
-            return perfect_sampling.expectation_value(tensor,hamiltonian,device=self.device, shot=shots)
+        from .optimization.gradients.batch_parameter_shift import (
+            expectation_value_batch as _perfect_sampling_batch,
+            expectation_value_batch_efficient_contraction,
+            expectation_value_batch_right_suffix,
+        )
+
+        single = theta.dim() == 1
+        theta_batch = theta.unsqueeze(0) if single else theta
+        if method == MeasureMethod.PERFECT_SAMPLING:
+            result = _perfect_sampling_batch(theta_batch, self, hamiltonian, shots)
         elif method == MeasureMethod.EFFICIENT_CONTRACTION:
-            return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device, chunk_size=shots)
+            result = expectation_value_batch_efficient_contraction(theta_batch, self, hamiltonian, shots)
         elif method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-            return right_suffix_sampling.expectation_value_batch(tensor,hamiltonian,device=self.device, shot=shots)
+            result = expectation_value_batch_right_suffix(theta_batch, self, hamiltonian, shots)
         else:
             raise NotImplementedError()
+        return result.squeeze(0) if single else result
