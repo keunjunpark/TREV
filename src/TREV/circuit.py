@@ -114,6 +114,6 @@ class Circuit(torch.nn.Module):
         elif method == MeasureMethod.EFFICIENT_CONTRACTION:
             return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device, chunk_size=shots)
         elif method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-            return efficient_contraction.expectation_value_batch(tensor,hamiltonian,device=self.device)
+            return right_suffix_sampling.expectation_value_batch(tensor,hamiltonian,device=self.device, shot=shots)
         else:
             raise NotImplementedError()
