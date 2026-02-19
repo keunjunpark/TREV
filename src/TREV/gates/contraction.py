@@ -1,6 +1,9 @@
 from typing import Tuple
+import warnings
 import torch
 from torch import Tensor
+
+warnings.filterwarnings("ignore", message="torch.linalg.svd")
 
 def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
     """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
