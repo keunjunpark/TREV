@@ -49,27 +49,49 @@ class NonParameterTwoQubitsGate(NonParameterGate):
 
     def apply(self,tensor):
         q0, q1 = self.qubits
+        N = tensor.shape[0]
         matrix = self.matrix_fun(None, self.device)
-        if q0 < q1:
+
+        # Wrap-around pair: sites (N-1, 0) share the bond
+        # tensor[N-1] axis 1 <-> tensor[0] axis 0.
+        # This is the SAME layout as the q0 < q1 convention,
+        # so (tensor[N-1], tensor[0]) is the correct argument order.
+        is_wrap_fwd = (q0 == N - 1 and q1 == 0)
+        is_wrap_bwd = (q0 == 0 and q1 == N - 1)
+
+        if is_wrap_fwd:
+            tensor[N-1], tensor[0] = _apply_double_qubit_gate(matrix, (tensor[N-1], tensor[0]))
+        elif is_wrap_bwd:
+            matrix_swapped = _swap_gate_matrix(matrix)
+            tensor[N-1], tensor[0] = _apply_double_qubit_gate(matrix_swapped, (tensor[N-1], tensor[0]))
+        elif q0 < q1:
             tensor[q0], tensor[q1] = _apply_double_qubit_gate(matrix, (tensor[q0], tensor[q1]))
         else:
-            # q0 > q1: shared bond is tensor[q0] axis 0 <-> tensor[q1] axis 1.
-            # _apply_double_qubit_gate assumes axis 1 of first <-> axis 0 of second,
-            # so swap tensor order and permute gate qubit labels.
+            # q0 > q1, non-wrap: shared bond is tensor[q1] axis 1 <-> tensor[q0] axis 0.
             matrix_swapped = _swap_gate_matrix(matrix)
             tensor[q1], tensor[q0] = _apply_double_qubit_gate(matrix_swapped, (tensor[q1], tensor[q0]))
 
     def apply_batch(self, batch_size, batch_tensor):
         q0, q1 = self.qubits
+        N = batch_tensor.shape[1]
         matrix = self.matrix_fun(batch_size, self.device)
-        if q0 < q1:
+
+        def _swap_matrix(m):
+            if m.ndim == 2:
+                return _swap_gate_matrix(m)
+            swap = _SWAP_4x4.to(dtype=m.dtype, device=m.device)
+            return swap @ m @ swap
+
+        is_wrap_fwd = (q0 == N - 1 and q1 == 0)
+        is_wrap_bwd = (q0 == 0 and q1 == N - 1)
+
+        if is_wrap_fwd:
+            batch_tensor[:, N-1], batch_tensor[:, 0] = _apply_double_qubit_gate_batch(matrix, (batch_tensor[:, N-1], batch_tensor[:, 0]))
+        elif is_wrap_bwd:
+            matrix_swapped = _swap_matrix(matrix)
+            batch_tensor[:, N-1], batch_tensor[:, 0] = _apply_double_qubit_gate_batch(matrix_swapped, (batch_tensor[:, N-1], batch_tensor[:, 0]))
+        elif q0 < q1:
             batch_tensor[:, q0], batch_tensor[:, q1] = _apply_double_qubit_gate_batch(matrix, (batch_tensor[:, q0], batch_tensor[:, q1]))
         else:
-            # Same fix for batched path: swap tensor order + permute gate.
-            if matrix.ndim == 2:
-                matrix_swapped = _swap_gate_matrix(matrix)
-            else:
-                # Batched gate matrices: (B, 4, 4)
-                swap = _SWAP_4x4.to(dtype=matrix.dtype, device=matrix.device)
-                matrix_swapped = swap @ matrix @ swap
+            matrix_swapped = _swap_matrix(matrix)
             batch_tensor[:, q1], batch_tensor[:, q0] = _apply_double_qubit_gate_batch(matrix_swapped, (batch_tensor[:, q1], batch_tensor[:, q0]))
