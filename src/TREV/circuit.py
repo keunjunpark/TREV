@@ -8,8 +8,9 @@ from typing import List, Literal
 import torch
 from torch import Tensor
 from .gates.non_parameter_gates import NonParameterOneQubitGate, NonParameterTwoQubitsGate, NonParameterGate
-from .gates.parameter_gates import ParameterOneQubitGate, ParameterGate
-from .gates.info import I, H,X,Y,Z, RX, RY, RZ, CNOT, SWAP
+from .gates.parameter_gates import ParameterOneQubitGate, ParameterTwoQubitGate, ParameterGate
+from .gates.info import I, H,X,Y,Z, RX, RY, RZ, ZZ, CNOT, SWAP
+from .gates.contraction import _apply_single_qubit_gate, _apply_single_qubit_gate_batch
 from .hamiltonian.hamiltonian import Hamiltonian
 from .measure.enums import MeasureMethod
 from .measure import contraction, perfect_sampling, efficient_contraction, right_suffix_sampling
@@ -71,29 +72,87 @@ class Circuit(torch.nn.Module):
     def swap(self, control:int, target:int):
         self.gates.append(NonParameterTwoQubitsGate([control,target], SWAP,self.device))
 
+    def zz(self, qubit0: int, qubit1: int):
+        """ZZ(θ) gate: equivalent to CX-RZ-CX but uses a single SVD."""
+        self.gates.append(ParameterTwoQubitGate([qubit0, qubit1], self.params_size, ZZ, self.device))
+        self.params_size += 1
+
+    def _compile_fused_ops(self):
+        """Group consecutive single-qubit gates into fusible blocks, separated by 2-qubit gates.
+
+        Returns a list of (op_type, payload):
+          - ('block1q', {qubit: [gate, ...]})  -- fusible single-qubit block
+          - ('2q', gate)                       -- non-parameter two-qubit gate
+          - ('p2q', gate)                      -- parameter two-qubit gate (e.g. ZZ)
+        """
+        ops = []
+        current_block = {}
+
+        for gate in self.gates:
+            if isinstance(gate, (ParameterOneQubitGate, NonParameterOneQubitGate)):
+                q = gate.qubit
+                if q not in current_block:
+                    current_block[q] = []
+                current_block[q].append(gate)
+            elif isinstance(gate, ParameterTwoQubitGate):
+                if current_block:
+                    ops.append(('block1q', current_block))
+                    current_block = {}
+                ops.append(('p2q', gate))
+            else:
+                if current_block:
+                    ops.append(('block1q', current_block))
+                    current_block = {}
+                ops.append(('2q', gate))
+
+        if current_block:
+            ops.append(('block1q', current_block))
+
+        return ops
+
     def build_tensor(self, theta: Tensor):
         tensor:Tensor = torch.zeros((self.num_qubit, self.rank, self.rank , 2), dtype=torch.cfloat, device=self.device)
         tensor[:, 0, 0, 0] = 1.0
-        for gate in self.gates:
-            if gate.has_parameter():
-                p_gate:ParameterGate = gate
-                p_gate.apply(theta, tensor)
-            else:
-                np_gate: NonParameterGate = gate
-                np_gate.apply(tensor)
+
+        ops = self._compile_fused_ops()
+        for op_type, payload in ops:
+            if op_type == 'block1q':
+                for qubit, gates in payload.items():
+                    fused = None
+                    for gate in gates:
+                        if gate.has_parameter():
+                            mat = gate.matrix_fun(theta[gate.theta_index], self.device)
+                        else:
+                            mat = gate.matrix_fun(None, self.device)
+                        fused = mat if fused is None else torch.mm(mat, fused)
+                    tensor[qubit] = _apply_single_qubit_gate(fused, tensor[qubit])
+            elif op_type == 'p2q':
+                payload.apply(theta, tensor)
+            else:  # '2q'
+                payload.apply(tensor)
         return tensor
-    
+
     def build_tensor_batch(self, theta: Tensor, batch_size:int):
         tensor: Tensor = torch.zeros((self.num_qubit, self.rank, self.rank, 2), dtype=torch.cfloat, device=self.device)
         tensor[:, 0, 0, 0] = 1.0
         tensor = tensor.unsqueeze(0).expand(batch_size, -1, -1, -1, -1).clone()
-        for gate in self.gates:
-            if gate.has_parameter():
-                p_gate:ParameterGate = gate
-                p_gate.apply_batch(theta, batch_size, tensor)
-            else:
-                np_gate: NonParameterGate = gate
-                np_gate.apply_batch(batch_size, tensor)
+
+        ops = self._compile_fused_ops()
+        for op_type, payload in ops:
+            if op_type == 'block1q':
+                for qubit, gates in payload.items():
+                    fused = None
+                    for gate in gates:
+                        if gate.has_parameter():
+                            mat = gate.matrix_fun(theta[:, gate.theta_index], self.device)
+                        else:
+                            mat = gate.matrix_fun(batch_size, self.device)
+                        fused = mat if fused is None else torch.bmm(mat, fused)
+                    tensor[:, qubit] = _apply_single_qubit_gate_batch(fused, tensor[:, qubit])
+            elif op_type == 'p2q':
+                payload.apply_batch(theta, batch_size, tensor)
+            else:  # '2q'
+                payload.apply_batch(batch_size, tensor)
         return tensor
 
     def measure(self, theta: Tensor, method:MeasureMethod=MeasureMethod.PERFECT_SAMPLING, shots:int= int(1e4)):

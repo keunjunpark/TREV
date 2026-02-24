@@ -73,6 +73,25 @@ def SWAP(batch_size=None, device:str=None):
         [0, 0, 0, 1]
     ], dtype=torch.cfloat).to(device)
 
+def ZZ(theta, device:str=None):
+    """ZZ(θ) = diag(e^{-iθ/2}, e^{iθ/2}, e^{iθ/2}, e^{-iθ/2}).
+
+    Equivalent to CX · RZ(θ) · CX, but requires only one SVD instead of two.
+    """
+    is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
+    theta = torch.atleast_1d(theta)
+    a = torch.exp(-1j * theta / 2)
+    b = torch.exp( 1j * theta / 2)
+    z = torch.zeros_like(theta)
+    # Build (B, 4, 4) diagonal matrix
+    row0 = torch.stack([a, z, z, z], dim=-1)
+    row1 = torch.stack([z, b, z, z], dim=-1)
+    row2 = torch.stack([z, z, b, z], dim=-1)
+    row3 = torch.stack([z, z, z, a], dim=-1)
+    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(dtype=torch.cfloat, device=device)
+    return mat[0] if is_scalar else mat
+
+
 def CNOT(batch_size=None, device:str=None):
     cnot=  torch.tensor([
         [1, 0, 0, 0],
