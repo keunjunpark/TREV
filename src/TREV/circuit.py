@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 from .gates.non_parameter_gates import NonParameterOneQubitGate, NonParameterTwoQubitsGate, NonParameterGate
 from .gates.parameter_gates import ParameterOneQubitGate, ParameterTwoQubitGate, ParameterGate
-from .gates.info import I, H,X,Y,Z, RX, RY, RZ, ZZ, CNOT, SWAP
+from .gates.info import I, H,X,Y,Z, RX, RY, RZ, ZZ, ZZ_SWAP, CNOT, SWAP
 from .gates.contraction import _apply_single_qubit_gate, _apply_single_qubit_gate_batch
 from .hamiltonian.hamiltonian import Hamiltonian
 from .measure.enums import MeasureMethod
@@ -75,6 +75,11 @@ class Circuit(torch.nn.Module):
     def zz(self, qubit0: int, qubit1: int):
         """ZZ(θ) gate: equivalent to CX-RZ-CX but uses a single SVD."""
         self.gates.append(ParameterTwoQubitGate([qubit0, qubit1], self.params_size, ZZ, self.device))
+        self.params_size += 1
+
+    def zz_swap(self, qubit0: int, qubit1: int):
+        """Fused ZZ(θ)·SWAP gate: applies ZZ interaction and swaps in a single SVD."""
+        self.gates.append(ParameterTwoQubitGate([qubit0, qubit1], self.params_size, ZZ_SWAP, self.device))
         self.params_size += 1
 
     def _compile_fused_ops(self):

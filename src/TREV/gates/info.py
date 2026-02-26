@@ -92,6 +92,33 @@ def ZZ(theta, device:str=None):
     return mat[0] if is_scalar else mat
 
 
+def ZZ_SWAP(theta, device:str=None):
+    """ZZ_SWAP(θ) = SWAP · ZZ(θ).
+
+    Fused gate that applies a ZZ interaction and then swaps the two qubits.
+    Requires only one SVD instead of two (one for ZZ + one for SWAP).
+
+    Matrix (computational basis |00⟩, |01⟩, |10⟩, |11⟩):
+        [[e^{-iθ/2},  0,          0,          0         ],
+         [0,          0,          e^{iθ/2},   0         ],
+         [0,          e^{iθ/2},   0,          0         ],
+         [0,          0,          0,          e^{-iθ/2} ]]
+    """
+    is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
+    theta = torch.atleast_1d(theta)
+    a = torch.exp(-1j * theta / 2)
+    b = torch.exp( 1j * theta / 2)
+    z = torch.zeros_like(theta)
+    # SWAP @ ZZ: rows of ZZ permuted by SWAP
+    # SWAP exchanges |01⟩ <-> |10⟩, so row1<->row2
+    row0 = torch.stack([a, z, z, z], dim=-1)  # |00⟩ -> e^{-iθ/2}|00⟩
+    row1 = torch.stack([z, z, b, z], dim=-1)  # |01⟩ -> e^{iθ/2}|10⟩
+    row2 = torch.stack([z, b, z, z], dim=-1)  # |10⟩ -> e^{iθ/2}|01⟩
+    row3 = torch.stack([z, z, z, a], dim=-1)  # |11⟩ -> e^{-iθ/2}|11⟩
+    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(dtype=torch.cfloat, device=device)
+    return mat[0] if is_scalar else mat
+
+
 def CNOT(batch_size=None, device:str=None):
     cnot=  torch.tensor([
         [1, 0, 0, 0],
