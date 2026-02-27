@@ -119,6 +119,32 @@ def ZZ_SWAP(theta, device:str=None):
     return mat[0] if is_scalar else mat
 
 
+def U3(params, device:str=None):
+    """U3(θ,φ,λ) = Rz(φ)·Ry(θ)·Rz(λ).
+
+    Args:
+        params: shape (3,) for scalar or (batch, 3) for batch.
+                params[..., 0] = theta, params[..., 1] = phi, params[..., 2] = lambda.
+    """
+    is_scalar = params.dim() == 1
+    if is_scalar:
+        params = params.unsqueeze(0)  # (1, 3)
+    theta = params[:, 0]
+    phi   = params[:, 1]
+    lam   = params[:, 2]
+    cos = torch.cos(theta / 2)
+    sin = torch.sin(theta / 2)
+    u00 = torch.exp(-1j * (phi + lam) / 2) * cos
+    u01 = -torch.exp(-1j * (phi - lam) / 2) * sin
+    u10 = torch.exp(1j * (phi - lam) / 2) * sin
+    u11 = torch.exp(1j * (phi + lam) / 2) * cos
+    mat = torch.stack([
+        torch.stack([u00, u01], dim=-1),
+        torch.stack([u10, u11], dim=-1)
+    ], dim=-2).to(dtype=torch.cfloat, device=device)
+    return mat[0] if is_scalar else mat
+
+
 def CNOT(batch_size=None, device:str=None):
     cnot=  torch.tensor([
         [1, 0, 0, 0],

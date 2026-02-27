@@ -29,6 +29,25 @@ class ParameterOneQubitGate(ParameterGate):
         matrix = self.matrix_fun(batch_theta[:, self.theta_index],self.device)
         batch_tensor[:, self.qubit] = _apply_single_qubit_gate_batch(matrix, batch_tensor[:, self.qubit] )
 
+class ParameterMultiOneQubitGate(ParameterGate):
+    """Single-qubit gate with multiple parameters (e.g. U3 with theta, phi, lambda)."""
+    def __init__(self, qubit:int, theta_indices:list, matrix_fun:Callable, device:str):
+        super().__init__(theta_indices[0], device)
+        self.qubit = qubit
+        self.theta_indices = theta_indices
+        self.matrix_fun = matrix_fun
+        self.num_params = len(theta_indices)
+
+    def apply(self, theta, tensor):
+        params = torch.stack([theta[i] for i in self.theta_indices])  # (num_params,)
+        matrix = self.matrix_fun(params, self.device)
+        tensor[self.qubit] = _apply_single_qubit_gate(matrix, tensor[self.qubit])
+
+    def apply_batch(self, batch_theta, batch_size, batch_tensor):
+        params = torch.stack([batch_theta[:, i] for i in self.theta_indices], dim=-1)  # (batch, num_params)
+        matrix = self.matrix_fun(params, self.device)
+        batch_tensor[:, self.qubit] = _apply_single_qubit_gate_batch(matrix, batch_tensor[:, self.qubit])
+
 class ParameterTwoQubitGate(ParameterGate):
     def __init__(self, qubits, theta_index: int, matrix_fun, device: str):
         super().__init__(theta_index, device)

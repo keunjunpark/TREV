@@ -8,8 +8,8 @@ from typing import List, Literal
 import torch
 from torch import Tensor
 from .gates.non_parameter_gates import NonParameterOneQubitGate, NonParameterTwoQubitsGate, NonParameterGate
-from .gates.parameter_gates import ParameterOneQubitGate, ParameterTwoQubitGate, ParameterGate
-from .gates.info import I, H,X,Y,Z, RX, RY, RZ, ZZ, ZZ_SWAP, CNOT, SWAP
+from .gates.parameter_gates import ParameterOneQubitGate, ParameterMultiOneQubitGate, ParameterTwoQubitGate, ParameterGate
+from .gates.info import I, H,X,Y,Z, RX, RY, RZ, U3, ZZ, ZZ_SWAP, CNOT, SWAP
 from .gates.contraction import _apply_single_qubit_gate, _apply_single_qubit_gate_batch
 from .hamiltonian.hamiltonian import Hamiltonian
 from .measure.enums import MeasureMethod
@@ -66,6 +66,11 @@ class Circuit(torch.nn.Module):
         self.gates.append(ParameterOneQubitGate(qubit, self.params_size, RZ,self.device))
         self.params_size += 1
 
+    def u3(self, qubit: int):
+        indices = [self.params_size, self.params_size + 1, self.params_size + 2]
+        self.gates.append(ParameterMultiOneQubitGate(qubit, indices, U3, self.device))
+        self.params_size += 3
+
     def cx(self, control:int, target:int):
         self.gates.append(NonParameterTwoQubitsGate([control,target], CNOT,self.device))
 
@@ -94,7 +99,7 @@ class Circuit(torch.nn.Module):
         current_block = {}
 
         for gate in self.gates:
-            if isinstance(gate, (ParameterOneQubitGate, NonParameterOneQubitGate)):
+            if isinstance(gate, (ParameterOneQubitGate, ParameterMultiOneQubitGate, NonParameterOneQubitGate)):
                 q = gate.qubit
                 if q not in current_block:
                     current_block[q] = []
@@ -125,7 +130,10 @@ class Circuit(torch.nn.Module):
                 for qubit, gates in payload.items():
                     fused = None
                     for gate in gates:
-                        if gate.has_parameter():
+                        if isinstance(gate, ParameterMultiOneQubitGate):
+                            params = torch.stack([theta[i] for i in gate.theta_indices])
+                            mat = gate.matrix_fun(params, self.device)
+                        elif gate.has_parameter():
                             mat = gate.matrix_fun(theta[gate.theta_index], self.device)
                         else:
                             mat = gate.matrix_fun(None, self.device)
@@ -148,7 +156,10 @@ class Circuit(torch.nn.Module):
                 for qubit, gates in payload.items():
                     fused = None
                     for gate in gates:
-                        if gate.has_parameter():
+                        if isinstance(gate, ParameterMultiOneQubitGate):
+                            params = torch.stack([theta[:, i] for i in gate.theta_indices], dim=-1)
+                            mat = gate.matrix_fun(params, self.device)
+                        elif gate.has_parameter():
                             mat = gate.matrix_fun(theta[:, gate.theta_index], self.device)
                         else:
                             mat = gate.matrix_fun(batch_size, self.device)
