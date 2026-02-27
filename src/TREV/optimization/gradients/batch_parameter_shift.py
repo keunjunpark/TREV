@@ -38,6 +38,8 @@ def _gpu_info(device: torch.device) -> str:
 
 def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method):
     """Route to the correct batched expectation value backend."""
+    if circuit.qubit_perm is not None:
+        hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
     if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
         return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots)
     elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:

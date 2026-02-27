@@ -22,6 +22,7 @@ class Circuit(torch.nn.Module):
         self.params_size:int = 0
         self.num_qubit = num_qubit
         self.device = device
+        self.qubit_perm: list | None = None
 
     def to_device(self, device: str) -> 'Circuit':
         """Create a lightweight clone targeting a different device.
@@ -32,6 +33,7 @@ class Circuit(torch.nn.Module):
         """
         clone = copy.copy(self)
         clone.device = device
+        clone.qubit_perm = self.qubit_perm
         clone.gates = []
         for gate in self.gates:
             g = copy.copy(gate)
@@ -186,6 +188,9 @@ class Circuit(torch.nn.Module):
             expectation_value_batch_efficient_contraction,
             expectation_value_batch_right_suffix,
         )
+
+        if self.qubit_perm is not None:
+            hamiltonian = hamiltonian.permuted(self.qubit_perm)
 
         single = theta.dim() == 1
         theta_batch = theta.unsqueeze(0) if single else theta

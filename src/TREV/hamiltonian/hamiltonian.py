@@ -27,6 +27,20 @@ class Hamiltonian():
         self.coefficients:List[complex] = coefficients
         self.num_qubits = num_qubits
 
+    def permuted(self, perm: list) -> 'Hamiltonian':
+        """Return new Hamiltonian with qubit indices permuted.
+
+        perm[logical] = physical: operator on logical qubit i moves to
+        position perm[i] in the new Hamiltonian.
+        """
+        new_paulis = []
+        for p in self.paulis:
+            chars = ['I'] * self.num_qubits
+            for i, ch in enumerate(p):
+                chars[perm[i]] = ch
+            new_paulis.append(''.join(chars))
+        return Hamiltonian(self.num_qubits, new_paulis, list(self.coefficients))
+
     def add_pauli(self, pauli, coefficient):
         if len(pauli) != self.num_qubits:
             raise ValueError(f"Pauli string length {len(pauli)} != num_qubits {self.num_qubits}")
