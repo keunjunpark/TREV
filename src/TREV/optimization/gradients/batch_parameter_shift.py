@@ -868,12 +868,16 @@ def expectation_value_batch_right_suffix(
                         nX = torch.linalg.norm(X.reshape(B, S, -1), dim=-1).clamp_min(1e-300).view(B, S, 1, 1)
                         X = X / nX
 
-                # Score using non-I mask for this group
+                # Score using non-I mask for this group, chunked over G to save memory
                 bf = bits.to(torch.float32).reshape(B * S, N)
-                cnt = bf @ nonI_mask.to(torch.float32).T  # (B*S, G)
-                parity = (cnt.remainder_(2.0) > 0.5)
-                sgn = torch.where(parity, -1.0, 1.0)
-                Eb = (sgn * group_coeffs.view(1, -1)).sum(dim=1)  # (B*S,)
+                Eb = torch.zeros(B * S, dtype=torch.float64, device=device)
+                for g0 in range(0, G, term_chunk):
+                    g1 = min(g0 + term_chunk, G)
+                    cnt = bf @ nonI_mask[g0:g1].to(torch.float32).T  # (B*S, g1-g0)
+                    parity = cnt.remainder_(2.0) > 0.5
+                    sgn = torch.where(parity, -1.0, 1.0)
+                    Eb += (sgn * group_coeffs[g0:g1].view(1, -1)).sum(dim=1)
+                    del cnt, parity, sgn
 
                 Eb = Eb.view(B, S)
                 totals += Eb.sum(dim=1)
