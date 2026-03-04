@@ -162,7 +162,6 @@ def expectation_value_batch(
         (B_total,) float64 tensor of estimated expectations (on CPU).
     """
     device = getattr(circuit, "device", param_batch.device)
-    ctype = torch.complex64 if use_complex64 else torch.complex128
 
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
@@ -191,6 +190,10 @@ def expectation_value_batch(
         param_view = param_batch[lo:hi]
         B = int(param_view.shape[0])
         ring = circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
+        if use_complex64:
+            ctype = ring.dtype if ring.is_complex() else torch.cfloat
+        else:
+            ctype = torch.complex128
         _, N_chk, chi_l, chi_r, d = ring.shape
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l

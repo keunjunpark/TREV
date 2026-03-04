@@ -15,7 +15,7 @@ from .hamiltonian.hamiltonian import Hamiltonian
 from .measure.enums import MeasureMethod
 from .measure import contraction, perfect_sampling, efficient_contraction, right_suffix_sampling
 class Circuit(torch.nn.Module):
-    def __init__(self, num_qubit:int, rank:int=10, device:str='cpu'):
+    def __init__(self, num_qubit:int, rank:int=10, device:str='cpu', cdtype=torch.cfloat):
         super().__init__()
         self.rank:int = rank
         self.gates:List[ParameterGate|NonParameterGate] = []
@@ -23,6 +23,7 @@ class Circuit(torch.nn.Module):
         self.num_qubit = num_qubit
         self.device = device
         self.qubit_perm: list | None = None
+        self.cdtype = cdtype
 
     def to_device(self, device: str) -> 'Circuit':
         """Create a lightweight clone targeting a different device.
@@ -145,6 +146,8 @@ class Circuit(torch.nn.Module):
                 payload.apply(theta, tensor)
             else:  # '2q'
                 payload.apply(tensor)
+        if self.cdtype != torch.cfloat:
+            tensor = tensor.to(self.cdtype)
         return tensor
 
     def build_tensor_batch(self, theta: Tensor, batch_size:int):
@@ -171,6 +174,8 @@ class Circuit(torch.nn.Module):
                 payload.apply_batch(theta, batch_size, tensor)
             else:  # '2q'
                 payload.apply_batch(batch_size, tensor)
+        if self.cdtype != torch.cfloat:
+            tensor = tensor.to(self.cdtype)
         return tensor
 
     def measure(self, theta: Tensor, method:MeasureMethod=MeasureMethod.PERFECT_SAMPLING, shots:int= int(1e4)):

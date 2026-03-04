@@ -108,6 +108,7 @@ def expectation_value_batch(
     Returns a real scalar tensor.
     """
     device = device or tensors.device
+    cdtype = tensors.dtype if tensors.is_complex() else torch.cfloat
     op_tensor = hamiltonian.get_pauli_op_tensor().to(device)   # (T, N) uint8
     if op_tensor.dim() != 2:
         raise ValueError("Expected op_tensor shape (T, N)")
@@ -115,7 +116,7 @@ def expectation_value_batch(
 
     coeffs = torch.as_tensor(
         [c.item() if hasattr(c, "item") else c for c in hamiltonian.coefficients],
-        dtype=torch.cfloat, device=device,
+        dtype=cdtype, device=device,
     )
 
     chi = tensors.shape[1]
@@ -123,10 +124,10 @@ def expectation_value_batch(
     # Cache per-site A0, A1 slices
     sites = []
     for i in range(N):
-        A = tensors[i].to(device=device, dtype=torch.cfloat)  # (chi, chi, 2)
+        A = tensors[i].to(device=device, dtype=cdtype)  # (chi, chi, 2)
         sites.append((A[:, :, 0].contiguous(), A[:, :, 1].contiguous()))
 
-    eye4 = torch.eye(chi * chi, dtype=torch.cfloat, device=device).reshape(chi, chi, chi, chi)
+    eye4 = torch.eye(chi * chi, dtype=cdtype, device=device).reshape(chi, chi, chi, chi)
 
     # Precompute left prefix under all-identity: L_pre[i] = E_I(0) @ ... @ E_I(i-1)
     L_pre = [None] * (N + 1)
@@ -149,7 +150,7 @@ def expectation_value_batch(
         R_suf_T[i] = acc
 
     # Per-term contraction: only at non-identity sites
-    total = torch.zeros((), dtype=torch.cfloat, device=device)
+    total = torch.zeros((), dtype=cdtype, device=device)
 
     for t in range(Tc):
         non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()

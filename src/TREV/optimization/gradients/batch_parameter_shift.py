@@ -642,11 +642,6 @@ def expectation_value_batch_efficient_contraction(
 
     # Hamiltonian
     op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
-    coeffs = torch.as_tensor(
-        hamiltonian.coefficients,
-        dtype=torch.cfloat if use_complex64 else torch.cdouble,
-        device=device,
-    )
     T, N = op_tensor.shape
 
     out_parts = []
@@ -659,7 +654,15 @@ def expectation_value_batch_efficient_contraction(
         ring = circuit.build_tensor_batch(param_view, B).to(device)  # (B,N,l,r,2)
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
-        ctype = torch.complex64 if use_complex64 else torch.complex128
+        if use_complex64:
+            ctype = ring.dtype if ring.is_complex() else torch.cfloat
+        else:
+            ctype = torch.complex128
+        coeffs = torch.as_tensor(
+            hamiltonian.coefficients,
+            dtype=ctype,
+            device=device,
+        )
         chi = l
 
         # Cache per-site A0/A1 slices
@@ -752,7 +755,6 @@ def expectation_value_batch_right_suffix(
         (B_total,) float64 tensor of estimated expectations (on CPU).
     """
     device = getattr(circuit, "device", param_batch.device)
-    ctype = torch.complex64 if use_complex64 else torch.complex128
 
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
@@ -781,6 +783,10 @@ def expectation_value_batch_right_suffix(
         param_view = param_batch[lo:hi]
         B = int(param_view.shape[0])
         ring = circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
+        if use_complex64:
+            ctype = ring.dtype if ring.is_complex() else torch.cfloat
+        else:
+            ctype = torch.complex128
         _, N_chk, chi_l, chi_r, d = ring.shape
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l
