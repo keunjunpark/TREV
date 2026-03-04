@@ -51,6 +51,8 @@ class NonParameterTwoQubitsGate(NonParameterGate):
         q0, q1 = self.qubits
         N = tensor.shape[0]
         matrix = self.matrix_fun(None, self.device)
+        if matrix.dtype != tensor.dtype:
+            matrix = matrix.to(tensor.dtype)
 
         # Wrap-around pair: sites (N-1, 0) share the bond
         # tensor[N-1] axis 1 <-> tensor[0] axis 0.
@@ -75,6 +77,8 @@ class NonParameterTwoQubitsGate(NonParameterGate):
         q0, q1 = self.qubits
         N = batch_tensor.shape[1]
         matrix = self.matrix_fun(batch_size, self.device)
+        if matrix.dtype != batch_tensor.dtype:
+            matrix = matrix.to(batch_tensor.dtype)
 
         def _swap_matrix(m):
             if m.ndim == 2:

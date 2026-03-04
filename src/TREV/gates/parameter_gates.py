@@ -58,6 +58,8 @@ class ParameterTwoQubitGate(ParameterGate):
         q0, q1 = self.qubits
         N = tensor.shape[0]
         matrix = self.matrix_fun(theta[self.theta_index], self.device)
+        if matrix.dtype != tensor.dtype:
+            matrix = matrix.to(tensor.dtype)
 
         is_wrap_fwd = (q0 == N - 1 and q1 == 0)
         is_wrap_bwd = (q0 == 0 and q1 == N - 1)
@@ -77,6 +79,8 @@ class ParameterTwoQubitGate(ParameterGate):
         q0, q1 = self.qubits
         N = batch_tensor.shape[1]
         matrix = self.matrix_fun(batch_theta[:, self.theta_index], self.device)
+        if matrix.dtype != batch_tensor.dtype:
+            matrix = matrix.to(batch_tensor.dtype)
 
         def _swap_matrix(m):
             if m.ndim == 2:
