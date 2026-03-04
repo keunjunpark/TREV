@@ -40,7 +40,7 @@ def RX(theta, device:str=None):  # theta can be scalar or batch
     rx = torch.stack([
         torch.stack([cos, -1j * sin], dim=-1),
         torch.stack([-1j * sin, cos], dim=-1)
-    ], dim=-2).to(device).type(torch.cfloat)
+    ], dim=-2).to(device=device)
     return rx[0] if is_scalar else rx
 
 def RY(theta, device:str=None):
@@ -51,7 +51,7 @@ def RY(theta, device:str=None):
     ry = torch.stack([
         torch.stack([cos, -sin], dim=-1),
         torch.stack([sin,  cos], dim=-1)
-    ], dim=-2).type(torch.cfloat).to(device)
+    ], dim=-2).to(device=device)
     return ry[0] if is_scalar else ry
 
 def RZ(theta, device:str=None):
@@ -62,7 +62,7 @@ def RZ(theta, device:str=None):
     rz = torch.stack([
         torch.stack([exp_m, torch.zeros_like(theta)], dim=-1),
         torch.stack([torch.zeros_like(theta), exp_p], dim=-1)
-    ], dim=-2).to(device).type(torch.cfloat)
+    ], dim=-2).to(device=device)
     return rz[0] if is_scalar else rz
 
 def SWAP(batch_size=None, device:str=None):
@@ -88,7 +88,7 @@ def ZZ(theta, device:str=None):
     row1 = torch.stack([z, b, z, z], dim=-1)
     row2 = torch.stack([z, z, b, z], dim=-1)
     row3 = torch.stack([z, z, z, a], dim=-1)
-    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(dtype=torch.cfloat, device=device)
+    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(device=device)
     return mat[0] if is_scalar else mat
 
 
@@ -115,7 +115,7 @@ def ZZ_SWAP(theta, device:str=None):
     row1 = torch.stack([z, z, b, z], dim=-1)  # |01⟩ -> e^{iθ/2}|10⟩
     row2 = torch.stack([z, b, z, z], dim=-1)  # |10⟩ -> e^{iθ/2}|01⟩
     row3 = torch.stack([z, z, z, a], dim=-1)  # |11⟩ -> e^{-iθ/2}|11⟩
-    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(dtype=torch.cfloat, device=device)
+    mat = torch.stack([row0, row1, row2, row3], dim=-2).to(device=device)
     return mat[0] if is_scalar else mat
 
 
@@ -141,7 +141,7 @@ def U3(params, device:str=None):
     mat = torch.stack([
         torch.stack([u00, u01], dim=-1),
         torch.stack([u10, u11], dim=-1)
-    ], dim=-2).to(dtype=torch.cfloat, device=device)
+    ], dim=-2).to(device=device)
     return mat[0] if is_scalar else mat
 
 

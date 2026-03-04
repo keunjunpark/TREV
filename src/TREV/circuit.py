@@ -124,7 +124,7 @@ class Circuit(torch.nn.Module):
         return ops
 
     def build_tensor(self, theta: Tensor):
-        tensor:Tensor = torch.zeros((self.num_qubit, self.rank, self.rank , 2), dtype=torch.cfloat, device=self.device)
+        tensor:Tensor = torch.zeros((self.num_qubit, self.rank, self.rank , 2), dtype=self.cdtype, device=self.device)
         tensor[:, 0, 0, 0] = 1.0
 
         ops = self._compile_fused_ops()
@@ -146,12 +146,10 @@ class Circuit(torch.nn.Module):
                 payload.apply(theta, tensor)
             else:  # '2q'
                 payload.apply(tensor)
-        if self.cdtype != torch.cfloat:
-            tensor = tensor.to(self.cdtype)
         return tensor
 
     def build_tensor_batch(self, theta: Tensor, batch_size:int):
-        tensor: Tensor = torch.zeros((self.num_qubit, self.rank, self.rank, 2), dtype=torch.cfloat, device=self.device)
+        tensor: Tensor = torch.zeros((self.num_qubit, self.rank, self.rank, 2), dtype=self.cdtype, device=self.device)
         tensor[:, 0, 0, 0] = 1.0
         tensor = tensor.unsqueeze(0).expand(batch_size, -1, -1, -1, -1).clone()
 
@@ -174,8 +172,6 @@ class Circuit(torch.nn.Module):
                 payload.apply_batch(theta, batch_size, tensor)
             else:  # '2q'
                 payload.apply_batch(batch_size, tensor)
-        if self.cdtype != torch.cfloat:
-            tensor = tensor.to(self.cdtype)
         return tensor
 
     def measure(self, theta: Tensor, method:MeasureMethod=MeasureMethod.PERFECT_SAMPLING, shots:int= int(1e4)):
