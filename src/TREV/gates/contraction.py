@@ -57,6 +57,8 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     # mps: 2 × χ1 × 2 × χ3 --> (2 * χ1) × (2 * χ3)
 
     u, s, v = torch.linalg.svd(mps)
+    # Zero out noise singular values to prevent accumulation at high rank
+    s = torch.where(s > s[0] * 1e-5, s, torch.zeros_like(s))
     x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).to(dtype=mps.dtype), v[:chi_3, :]
     qu0 = torch.mm(x, sx).reshape((2, chi_1, chi_1))
     qu1 = y.reshape((chi_3, 2, chi_3))
@@ -101,6 +103,9 @@ def  _apply_double_qubit_gate_batch(
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
     u, s, vh = torch.linalg.svd(mps)
+    # Zero out noise singular values to prevent accumulation at high rank
+    threshold = s[:, 0:1] * 1e-5
+    s = torch.where(s > threshold, s, torch.zeros_like(s))
     x  = u[:, :, :chi1]
     sx = torch.diag_embed(s[:, :chi1]).to(dtype=qu0.dtype)
     y  = vh[:, :chi3, :]
