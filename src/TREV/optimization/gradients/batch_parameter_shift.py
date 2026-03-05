@@ -550,6 +550,9 @@ def expectation_value_batch(
             if done > 0:
                 grand_totals += totals / done
 
+            del rotated, nonI_mask, group_coeffs, totals
+
+        del ring_tensor_batch
         return grand_totals.float().detach()
 
 
