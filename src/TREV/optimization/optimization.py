@@ -49,6 +49,7 @@ def minimize(
         iteration_times = []
 
         start = time.time()
+        time_after_first_iter = None
 
         for epoch in range(iteration):
             it_time = time.time()
@@ -122,7 +123,9 @@ def minimize(
             _t_best = time.time() - _t0
 
             #print(f"\n[TREV] Epoch {epoch}: grad={_t_grad:.2f}s, exp_value={_t_exp:.2f}s, best_result={_t_best:.2f}s", flush=True)
-            progress_bar(epoch, iteration, start, exp_value)
+            if epoch == 0:
+                time_after_first_iter = time.time()
+            progress_bar(epoch, iteration, time_after_first_iter if epoch > 0 else None, exp_value)
 
             if epoch % 10 == 0:
                 gc.collect()
@@ -142,14 +145,24 @@ def minimize(
 
         return theta, exp_values, best_result, iteration_times
 
-def progress_bar(current, total, start_time, loss=None, bar_len=30):
+def progress_bar(current, total, start_time_after_first, loss=None, bar_len=30):
     percent = float(current) / total
     arrow = '=' * int(round(percent * bar_len) - 1) + '>' if current < total else '=' * bar_len
     spaces = ' ' * (bar_len - len(arrow))
 
-    elapsed = time.time() - start_time
-    eta = (elapsed / current) * (total - current) if current > 0 else 0
-    eta_str = time.strftime("%M:%S", time.gmtime(eta))
+    if start_time_after_first is not None and current > 0:
+        elapsed = time.time() - start_time_after_first
+        iters_done = current  # iterations done since iter 0
+        iters_left = total - current
+        eta = (elapsed / iters_done) * iters_left
+    else:
+        eta = 0
+
+    days = int(eta // 86400)
+    hours = int((eta % 86400) // 3600)
+    minutes = int((eta % 3600) // 60)
+    seconds = int(eta % 60)
+    eta_str = f"{days}d{hours:02d}h{minutes:02d}m{seconds:02d}s"
 
     metrics = f" | Loss: {loss:.4f}" if loss is not None else ""
 
