@@ -12,6 +12,7 @@ from ..measure.enums import MeasureMethod
 from ..optimization.gradients.gradient import Gradient
 from ..optimization.optimizer import Optimizer
 from ..measure.right_suffix_sampling import argmax_bitstring_tr_right_suffix
+from ..gates import contraction as _contraction
 import cProfile
 import time, gc, torch
 from TREV.optimization.gradients.gradient import MeasureMethod
@@ -27,6 +28,7 @@ def minimize(
     wall_clock_cap: float | None = None,
     param_mapping: torch.Tensor | None = None,
     param_base: torch.Tensor | None = None,
+    upcast: bool = False,
 ):
     """
     Minimization loop with optional wall clock cap.
@@ -35,7 +37,12 @@ def minimize(
     optimizer works in the K-dimensional subspace of logical parameters.
     ``theta`` should then be K-dimensional.  The full TREV theta is
     recovered as ``full_theta = param_base + param_mapping @ theta``.
+
+    When *upcast* is True, SVD operations in 2-qubit gate contractions
+    are performed in cdouble for numerical stability, then cast back.
     """
+    _prev_upcast = _contraction.UPCAST_SVD
+    _contraction.UPCAST_SVD = upcast
     with torch.no_grad():
         theta = theta.clone().to(circuit.device)
         if param_mapping is not None:
@@ -143,6 +150,7 @@ def minimize(
             gradient._gpu_pool.shutdown()
             gradient._gpu_pool = None
 
+        _contraction.UPCAST_SVD = _prev_upcast
         return theta, exp_values, best_result, iteration_times
 
 def progress_bar(current, total, start_time_after_first, loss=None, bar_len=30):
@@ -162,7 +170,7 @@ def progress_bar(current, total, start_time_after_first, loss=None, bar_len=30):
     hours = int((eta % 86400) // 3600)
     minutes = int((eta % 3600) // 60)
     seconds = int(eta % 60)
-    eta_str = f"{days}d{hours:02d}h{minutes:02d}m{seconds:02d}s"
+    eta_str = f"{days}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
 
     metrics = f" | Loss: {loss:.4f}" if loss is not None else ""
 

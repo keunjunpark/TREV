@@ -8,7 +8,11 @@ warnings.filterwarnings("ignore", message="torch.linalg.svd")
 # Relative SVD threshold: singular values below s_max * SVD_THRESHOLD
 # are zeroed out to prevent noise accumulation across many gates.
 # Set to 0.0 to disable thresholding entirely.
-SVD_THRESHOLD: float = 1e-3
+SVD_THRESHOLD: float = 0.0
+
+# When True, upcast tensors to cdouble before SVD and cast back after.
+# Reduces numerical noise accumulation across many 2-qubit gates.
+UPCAST_SVD: bool = False
 
 def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
     """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
@@ -40,8 +44,14 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     """ Apply the specified 2-qubit gate matrix on the specified ring-tensors """
     # gate_matrix: 4 × 4
     qu0, qu1 = qu_state_tensors
+    orig_dtype = qu0.dtype
     # qu0: χ1 × χ2 × 2
     # qu1: χ2 × χ3 × 2
+
+    if UPCAST_SVD and orig_dtype != torch.cdouble:
+        qu0 = qu0.to(torch.cdouble)
+        qu1 = qu1.to(torch.cdouble)
+        gate_matrix = gate_matrix.to(torch.cdouble)
 
     chi_1 = qu0.shape[0]
     chi_3 = qu1.shape[1]
@@ -74,6 +84,10 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     qu1 = torch.moveaxis(qu1, 1, 2)
     # qu1: χ3 × χ3 × 2
 
+    if UPCAST_SVD and orig_dtype != torch.cdouble:
+        qu0 = qu0.to(orig_dtype)
+        qu1 = qu1.to(orig_dtype)
+
     return qu0, qu1
 
 
@@ -90,9 +104,15 @@ def  _apply_double_qubit_gate_batch(
     qu1' : (B, χ3, χ3, 2)
     """
     qu0, qu1 = qu_state_tensors
+    orig_dtype = qu0.dtype
     B, chi1, chi2, _ = qu0.shape
     _, chi2_, chi3, _ = qu1.shape
     assert chi2 == chi2_, "Bond mismatch between the two site tensors"
+
+    if UPCAST_SVD and orig_dtype != torch.cdouble:
+        qu0 = qu0.to(torch.cdouble)
+        qu1 = qu1.to(torch.cdouble)
+        gate_matrix = gate_matrix.to(torch.cdouble)
 
     mps = torch.einsum('bikp,bkjq->bijpq', qu0, qu1)
 
@@ -114,9 +134,13 @@ def  _apply_double_qubit_gate_batch(
         threshold = s[:, 0:1] * SVD_THRESHOLD
         s = torch.where(s > threshold, s, torch.zeros_like(s))
     x  = u[:, :, :chi1]
-    sx = torch.diag_embed(s[:, :chi1]).to(dtype=qu0.dtype)
+    sx = torch.diag_embed(s[:, :chi1]).to(dtype=mps.dtype)
     y  = vh[:, :chi3, :]
     qu0_new = torch.bmm(x, sx).reshape(B, 2, chi1, chi1).permute(0, 2, 3, 1)
     qu1_new = y.reshape(B, chi3, 2, chi3).permute(0, 1, 3, 2)
+
+    if UPCAST_SVD and orig_dtype != torch.cdouble:
+        qu0_new = qu0_new.to(orig_dtype)
+        qu1_new = qu1_new.to(orig_dtype)
 
     return qu0_new, qu1_new

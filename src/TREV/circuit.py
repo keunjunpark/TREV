@@ -140,7 +140,7 @@ class Circuit(torch.nn.Module):
                             mat = gate.matrix_fun(theta[gate.theta_index], self.device)
                         else:
                             mat = gate.matrix_fun(None, self.device)
-                        if self.cdtype != torch.cfloat:
+                        if mat.dtype != self.cdtype:
                             mat = mat.to(self.cdtype)
                         fused = mat if fused is None else torch.mm(mat, fused)
                     tensor[qubit] = _apply_single_qubit_gate(fused, tensor[qubit])
@@ -168,7 +168,7 @@ class Circuit(torch.nn.Module):
                             mat = gate.matrix_fun(theta[:, gate.theta_index], self.device)
                         else:
                             mat = gate.matrix_fun(batch_size, self.device)
-                        if self.cdtype != torch.cfloat:
+                        if mat.dtype != self.cdtype:
                             mat = mat.to(self.cdtype)
                         fused = mat if fused is None else torch.bmm(mat, fused)
                     tensor[:, qubit] = _apply_single_qubit_gate_batch(fused, tensor[:, qubit])
