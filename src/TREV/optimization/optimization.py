@@ -81,7 +81,11 @@ def minimize(
 
             # --- expectation value ---
             _t0 = time.time()
-            exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method)
+            shots = getattr(gradient, 'shots', None)
+            if shots is not None:
+                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method, int(shots))
+            else:
+                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method)
             _t_exp = time.time() - _t0
             exp_values.append(exp_value)
 
