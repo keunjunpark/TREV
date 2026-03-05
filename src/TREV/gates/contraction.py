@@ -5,6 +5,11 @@ from torch import Tensor
 
 warnings.filterwarnings("ignore", message="torch.linalg.svd")
 
+# Relative SVD threshold: singular values below s_max * SVD_THRESHOLD
+# are zeroed out to prevent noise accumulation across many gates.
+# Set to 0.0 to disable thresholding entirely.
+SVD_THRESHOLD: float = 1e-3
+
 def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
     """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
     m, n = matrix.shape
@@ -58,7 +63,8 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
 
     u, s, v = torch.linalg.svd(mps)
     # Zero out noise singular values to prevent accumulation at high rank
-    s = torch.where(s > s[0] * 1e-3, s, torch.zeros_like(s))
+    if SVD_THRESHOLD > 0:
+        s = torch.where(s > s[0] * SVD_THRESHOLD, s, torch.zeros_like(s))
     x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).to(dtype=mps.dtype), v[:chi_3, :]
     qu0 = torch.mm(x, sx).reshape((2, chi_1, chi_1))
     qu1 = y.reshape((chi_3, 2, chi_3))
@@ -104,8 +110,9 @@ def  _apply_double_qubit_gate_batch(
 
     u, s, vh = torch.linalg.svd(mps)
     # Zero out noise singular values to prevent accumulation at high rank
-    threshold = s[:, 0:1] * 1e-3
-    s = torch.where(s > threshold, s, torch.zeros_like(s))
+    if SVD_THRESHOLD > 0:
+        threshold = s[:, 0:1] * SVD_THRESHOLD
+        s = torch.where(s > threshold, s, torch.zeros_like(s))
     x  = u[:, :, :chi1]
     sx = torch.diag_embed(s[:, :chi1]).to(dtype=qu0.dtype)
     y  = vh[:, :chi3, :]
