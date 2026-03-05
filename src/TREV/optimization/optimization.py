@@ -24,14 +24,23 @@ def minimize(
     gradient: Gradient,
     iteration: int,
     best_value_method: str,
-    wall_clock_cap: float | None = None,     # <--- NEW
+    wall_clock_cap: float | None = None,
+    param_mapping: torch.Tensor | None = None,
+    param_base: torch.Tensor | None = None,
 ):
     """
     Minimization loop with optional wall clock cap.
-    Stops early if elapsed real time > wall_clock_cap.
+
+    When *param_mapping* (P, K) and *param_base* (P,) are supplied, the
+    optimizer works in the K-dimensional subspace of logical parameters.
+    ``theta`` should then be K-dimensional.  The full TREV theta is
+    recovered as ``full_theta = param_base + param_mapping @ theta``.
     """
     with torch.no_grad():
         theta = theta.clone().to(circuit.device)
+        if param_mapping is not None:
+            param_mapping = param_mapping.to(circuit.device)
+            param_base = param_base.to(circuit.device)
         optim = optimizer.get_optimizer([theta])
         lr = optimizer.args['lr']
 
@@ -45,18 +54,34 @@ def minimize(
             it_time = time.time()
             optim.zero_grad()
 
+            # Compute full-space theta
+            if param_mapping is not None:
+                full_theta = param_base + param_mapping @ theta
+            else:
+                full_theta = theta
+
             _t0 = time.time()
-            grad = gradient.run(theta, circuit, hamiltonian)
-            theta.grad = grad
+            grad = gradient.run(full_theta, circuit, hamiltonian)
+
+            # Project gradient back to subspace if needed
+            if param_mapping is not None:
+                theta.grad = param_mapping.T @ grad
+            else:
+                theta.grad = grad
+
             optim.step()
             if circuit.device == 'cuda':
                 torch.cuda.synchronize()
             _t_grad = time.time() - _t0
             iteration_times.append(time.time() - it_time)
 
+            # Recompute full_theta after optimizer step
+            if param_mapping is not None:
+                full_theta = param_base + param_mapping @ theta
+
             # --- expectation value ---
             _t0 = time.time()
-            exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
+            exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method)
             _t_exp = time.time() - _t0
             exp_values.append(exp_value)
 
@@ -64,29 +89,29 @@ def minimize(
             _t0 = time.time()
             if best_value_method == 'highest_probability':
                 best_result.append(
-                    get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
+                    get_value_of_highest_probability(circuit.build_tensor(full_theta), circuit.device)
                 )
             elif best_value_method == 'argmax_tr_noinv_BE':
                 best_result.append(
-                    argmax_bitstring_tr_right_suffix(circuit.build_tensor(theta))
+                    argmax_bitstring_tr_right_suffix(circuit.build_tensor(full_theta))
                 )
             elif best_value_method == 'full_contraction':
-                best_idx = contract_tensor_ring(circuit.build_tensor(theta)).abs().pow(2).argmax().item()
+                best_idx = contract_tensor_ring(circuit.build_tensor(full_theta)).abs().pow(2).argmax().item()
                 num_qubits = circuit.num_qubit
                 best_bitstring = format(best_idx, f'0{num_qubits}b')
                 best_result.append(best_bitstring[::-1])
             else:
                 if gradient.measure_method in [MeasureMethod.PERFECT_SAMPLING]:
                     best_result.append(
-                        get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
+                        get_value_of_highest_probability(circuit.build_tensor(full_theta), circuit.device)
                     )
                 elif gradient.measure_method in [MeasureMethod.FULL_CONTRACTION, MeasureMethod.EFFICIENT_CONTRACTION]:
                     best_result.append(
-                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(circuit.build_tensor(full_theta), circuit.device)
                     )
                 elif gradient.measure_method in [MeasureMethod.RIGHT_SUFFIX_SAMPLING]:
                     best_result.append(
-                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(circuit.build_tensor(full_theta), circuit.device)
                     )
                 else:
                     raise NotImplementedError()

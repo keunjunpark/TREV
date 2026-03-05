@@ -371,3 +371,64 @@ def from_qiskit(
 
     theta = torch.tensor(param_values, dtype=torch.float32) if all_numeric else None
     return out, theta
+
+
+def build_parameter_mapping(
+    qc,
+    fuse_zz_swap: bool = False,
+    rank: int = 10,
+    device: str = 'cpu',
+) -> Tuple['Circuit', torch.Tensor, torch.Tensor, List[str]]:
+    """Build linear mapping from Qiskit logical params to TREV theta.
+
+    The parameter mapping is linear::
+
+        full_theta = param_base + jacobian @ logical_params
+
+    Works for any parameterized circuit (QAOA, UCCSD, hardware-efficient
+    ansatz, etc.).  The Jacobian is computed numerically by probing
+    :func:`from_qiskit` with zero and unit vectors.
+
+    Parameters
+    ----------
+    qc : qiskit.circuit.QuantumCircuit
+        Parameterized Qiskit circuit (already routed, NOT bound).
+    fuse_zz_swap : bool
+        Whether to fuse ``rzz + swap`` into ``zz_swap``.
+    rank : int
+        TREV bond dimension.
+    device : str
+        Torch device for the TREV circuit.
+
+    Returns
+    -------
+    (circuit, param_base, jacobian, param_names)
+        circuit : Circuit — TREV circuit (structure only).
+        param_base : Tensor (P,) — TREV theta when all logical params = 0.
+        jacobian : Tensor (P, K) — maps K logical params to P TREV params.
+        param_names : list of K parameter name strings.
+    """
+    params = sorted(qc.parameters, key=lambda p: p.name)
+    param_names = [p.name for p in params]
+    K = len(params)
+
+    # Bind all params to zero → get theta_base
+    zero_bind = {p: 0.0 for p in params}
+    qc_zero = qc.assign_parameters(zero_bind)
+    circuit, param_base = from_qiskit(
+        qc_zero, fuse_zz_swap=fuse_zz_swap, rank=rank, device=device,
+    )
+    P = param_base.shape[0]
+
+    # Compute Jacobian columns by probing with unit vectors
+    jacobian = torch.zeros(P, K, dtype=param_base.dtype)
+    for i, param in enumerate(params):
+        unit_bind = {p: 0.0 for p in params}
+        unit_bind[param] = 1.0
+        qc_unit = qc.assign_parameters(unit_bind)
+        _, theta_unit = from_qiskit(
+            qc_unit, fuse_zz_swap=fuse_zz_swap, rank=rank, device=device,
+        )
+        jacobian[:, i] = (theta_unit - param_base).cpu()
+
+    return circuit, param_base.cpu(), jacobian, param_names
