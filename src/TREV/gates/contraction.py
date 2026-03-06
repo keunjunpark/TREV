@@ -14,13 +14,38 @@ SVD_THRESHOLD: float = 0.0
 # Reduces numerical noise accumulation across many 2-qubit gates.
 UPCAST_SVD: bool = False
 
-def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
-    """Compute SVD, returning (U, S, Vh).
+# When True, use eigendecomposition of M^H M for truncated SVD.
+# ~1.6x faster for batched (B>=24) operations on GPU.
+# Slower for small batches (B<10) due to matmul overhead.
+# Test on your hardware before enabling.
+USE_EIGH_SVD: bool = False
 
-    Always uses full SVD via torch.linalg.svd (cuSOLVER on GPU).
-    Randomized svd_lowrank is slower when rank ~ n/2 due to overhead.
+def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Compute truncated SVD, returning (U_k, S_k, Vh_k).
+
+    For batched inputs with USE_EIGH_SVD=True, uses eigendecomposition
+    of M^H M which is ~1.6x faster for the gradient computation path.
+    Single (non-batched) inputs always use torch.linalg.svd.
     """
-    return torch.linalg.svd(matrix, full_matrices=False)
+    if matrix.ndim == 2 or not USE_EIGH_SVD:
+        return torch.linalg.svd(matrix, full_matrices=False)
+
+    # Batched eigh path: M^H M is Hermitian positive semi-definite
+    MhM = torch.bmm(matrix.conj().transpose(-2, -1), matrix)
+    eigenvalues, V = torch.linalg.eigh(MhM)
+
+    # eigh returns ascending order; take top-k (last k columns)
+    s_sq = eigenvalues[:, -rank:].flip(-1).clamp(min=0)
+    s = s_sq.sqrt()
+    Vk = V[:, :, -rank:].flip(-1)
+
+    # U_k = M V_k S_k^{-1}
+    s_safe = s.clamp(min=1e-30)
+    Uk = torch.bmm(matrix, Vk) / s_safe.unsqueeze(-2)
+
+    Vhk = Vk.conj().transpose(-2, -1)
+
+    return Uk, s, Vhk
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
