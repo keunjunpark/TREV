@@ -81,35 +81,32 @@ def _distribute_params_evenly(P, num_gpus, chunk_size):
 
 
 def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, shots,
-                  measure_method, chunk_size, grad_shared, shots_mode='total'):
+                  measure_method, chunk_size, grad_shared, shots_mode='total',
+                  active_params_cpu=None):
     """Multiprocessing worker: compute gradient slices on assigned GPU."""
     import traceback
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
     base_dev = base_cpu.to(device)
+    if active_params_cpu is not None:
+        active_params_dev = active_params_cpu.to(device)
 
     try:
-        # Build checkpoints once for prefix reuse
-        param_to_op = circuit_clone.get_param_to_op_map()
-        base_params = base_dev.squeeze(0)  # (P,)
-        _, checkpoints = circuit_clone.build_tensor_with_checkpoints(base_params)
-
         for start, stop in ranges:
             C = stop - start
-            idx = torch.arange(start, stop, device=device)
+            if active_params_cpu is not None:
+                idx = active_params_dev[start:stop]
+            else:
+                idx = torch.arange(start, stop, device=device)
             arange_C = torch.arange(C, device=device)
 
             batch = base_dev.expand(2 * C, -1).clone()
             batch[arange_C, idx] += shift
             batch[C + arange_C, idx] -= shift
 
-            earliest_op = min(param_to_op.get(p, 0) for p in range(start, stop))
-            ring_tensor = circuit_clone.build_tensor_batch_from(batch, 2 * C, earliest_op, checkpoints[earliest_op])
-
-            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
+            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
             grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-            grad_shared[start:stop] = grad_slice.cpu()
-            del ring_tensor
+            grad_shared[idx.cpu()] = grad_slice.cpu()
     except Exception as e:
         print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
         traceback.print_exc()
@@ -121,7 +118,8 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, sho
 def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                           measure_method, chunk_size,
                           base_shared, grad_shared, ranges_queue, done_barrier,
-                          shutdown_event, shots_mode='total'):
+                          shutdown_event, shots_mode='total',
+                          active_params_shared=None):
     """Persistent process worker — stays alive across iterations.
 
     Waits for work on ranges_queue, computes, writes to grad_shared,
@@ -130,7 +128,8 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
     import traceback
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
-    param_to_op = circuit_clone.get_param_to_op_map()
+    if active_params_shared is not None:
+        active_params_dev = active_params_shared.to(device)
 
     try:
         while not shutdown_event.is_set():
@@ -147,29 +146,22 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                 P = base_shared.shape[0]
                 base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
 
-                # Build checkpoints once per iteration for prefix reuse
-                base_params = base_shared.to(device)  # (P,)
-                _, checkpoints = circuit_clone.build_tensor_with_checkpoints(base_params)
-
                 for start, stop in ranges:
                     C = stop - start
-                    idx = torch.arange(start, stop, device=device)
+                    if active_params_shared is not None:
+                        idx = active_params_dev[start:stop]
+                    else:
+                        idx = torch.arange(start, stop, device=device)
                     arange_C = torch.arange(C, device=device)
 
                     batch = base_dev.expand(2 * C, -1).clone()
                     batch[arange_C, idx] += shift
                     batch[C + arange_C, idx] -= shift
 
-                    earliest_op = min(param_to_op.get(p, 0) for p in range(start, stop))
-                    ring_tensor = circuit_clone.build_tensor_batch_from(batch, 2 * C, earliest_op, checkpoints[earliest_op])
-
                     exp_vals = _dispatch_expectation(
-                        batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
+                        batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
                     grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                    grad_shared[start:stop] = grad_slice.cpu()
-                    del ring_tensor
-
-                del checkpoints
+                    grad_shared[idx.cpu()] = grad_slice.cpu()
             except Exception as e:
                 print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
                 traceback.print_exc()
@@ -191,7 +183,8 @@ class _MultiGPUPool:
     _active_pool = None  # class-level singleton — only one pool at a time
 
     def __init__(self, num_gpus, circuit, hamiltonian, shift, shots,
-                 measure_method, chunk_size, P, shots_mode='total'):
+                 measure_method, chunk_size, P, shots_mode='total',
+                 active_params=None):
         # Kill any previous pool first (e.g. from a different gradient object)
         if _MultiGPUPool._active_pool is not None:
             print("[TREV] Shutting down previous multi-GPU pool", flush=True)
@@ -203,10 +196,16 @@ class _MultiGPUPool:
         circuit_cpu = circuit.to_device('cpu')
         self.num_gpus = num_gpus
         self.P = P
+        self.active_params = active_params
+        self.A = active_params.numel() if active_params is not None else P
 
         # Shared-memory tensors for data exchange (no Queue serialization)
         self.base_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
         self.grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+        # Share active_params with workers
+        active_params_shared = None
+        if active_params is not None:
+            active_params_shared = active_params.cpu().to(torch.long).share_memory_()
 
         # Per-worker queue for sending ranges
         self.ranges_queues = [ctx.Queue() for _ in range(num_gpus)]
@@ -222,7 +221,8 @@ class _MultiGPUPool:
                       measure_method, chunk_size,
                       self.base_shared, self.grad_shared,
                       self.ranges_queues[gpu_id], self.done_barrier,
-                      self.shutdown_event, shots_mode),
+                      self.shutdown_event, shots_mode,
+                      active_params_shared),
             )
             p.daemon = True
             p.start()
@@ -238,8 +238,11 @@ class _MultiGPUPool:
         # Free main-process GPU cache so GPU 0 worker has room
         torch.cuda.empty_cache()
 
-        # Distribute parameters evenly across GPUs
-        gpu_ranges = _distribute_params_evenly(P, self.num_gpus, chunk_size)
+        # Zero grad before workers write sparse results
+        self.grad_shared.zero_()
+
+        # Distribute only active parameters across GPUs
+        gpu_ranges = _distribute_params_evenly(self.A, self.num_gpus, chunk_size)
 
         # Send work to each worker
         for gpu_id in range(self.num_gpus):
@@ -308,10 +311,12 @@ class BatchParameterShiftGradient(Gradient):
         if (self.batch_size is None) and (not self._autotuned):
             device = torch.device(circuit.device) if isinstance(circuit.device, str) else circuit.device
             P = theta.numel()
+            # With active_params, we only shift A params → batch is 2A, not 2P
+            A = self.active_params.numel() if self.active_params is not None else P
             base = theta.detach().to(device).unsqueeze(0)
 
             def run_batch_fn(bs: int):
-                idx = torch.arange(0, min(bs, P), device=device)
+                idx = torch.arange(0, min(bs, A), device=device)
                 C = idx.numel()
                 if C == 0:
                     return
@@ -326,7 +331,7 @@ class BatchParameterShiftGradient(Gradient):
                 run_batch_fn,
                 device,
                 min_bs=1,
-                max_bs=min(4096, P),
+                max_bs=min(4096, 2 * A),
                 safety_frac=0.85,
                 warmup=1,
                 use_amp=False,
@@ -343,7 +348,7 @@ class BatchParameterShiftGradient(Gradient):
                 else:
                     spg = max(1, self.shots // n_groups)
                 gpu_msg = f"[TREV] Auto batch_size selected: {self.batch_size} " \
-                          f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
+                          f"(measure={self.measure_method.name}, active_params={A}/{P}, device={_gpu_info(device)})"
                 gpu_msg += f"\n[TREV] QWC groups: {n_groups}, shots_mode='{self.shots_mode}', shots_per_group={spg}"
                 if self._num_gpus > 1:
                     gpu_msg += f"\n[TREV] Multi-GPU enabled: {self._num_gpus} GPUs"
@@ -358,6 +363,7 @@ class BatchParameterShiftGradient(Gradient):
                     self._num_gpus, circuit, hamiltonian,
                     self.shift, self.shots, self.measure_method,
                     self.batch_size, theta.numel(), self.shots_mode,
+                    active_params=self.active_params,
                 )
             device = circuit.device
             val = self._gpu_pool.compute_gradient(theta, self.batch_size, device)
@@ -421,8 +427,9 @@ def batch_gradient(
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         elif num_gpus is not None and num_gpus > 1 and P > 0:
             # --- Multi-GPU path (multiprocessing to avoid GIL) ---
-            # Distribute parameters evenly across GPUs
-            gpu_ranges = _distribute_params_evenly(P, num_gpus, chunk_size)
+            # Distribute only active parameters across GPUs
+            A = active_params.numel() if active_params is not None else P
+            gpu_ranges = _distribute_params_evenly(A, num_gpus, chunk_size)
 
             # CPU copies for safe cross-process sharing
             circuit_cpu = circuit.to_device('cpu')
@@ -440,6 +447,7 @@ def batch_gradient(
                 print(f"[TREV]   GPU {gpu_id}: {n_ch} chunks, {n_p} params", flush=True)
 
             # Launch worker processes (spawn context for CUDA safety)
+            active_cpu = active_params.cpu() if active_params is not None else None
             ctx = mp.get_context('spawn')
             processes = []
             for gpu_id in range(num_gpus):
@@ -449,7 +457,8 @@ def batch_gradient(
                     target=_mp_worker_fn,
                     args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
                           hamiltonian, shift, shots, measure_method,
-                          chunk_size, grad_shared, shots_mode),
+                          chunk_size, grad_shared, shots_mode,
+                          active_cpu),
                 )
                 p.start()
                 print(f"[TREV] GPU {gpu_id} process started (PID {p.pid})", flush=True)
