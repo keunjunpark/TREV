@@ -296,6 +296,11 @@ class BatchParameterShiftGradient(Gradient):
 
         self._gpu_pool = None  # lazy-initialized persistent pool
 
+        # When set to a 1-D index tensor, only these params are shifted.
+        # Inactive params get zero gradient.  Set by minimize() when
+        # param_mapping is available and sparse.
+        self.active_params: torch.Tensor | None = None
+
         # optional: control printing via env var
         self._verbose = True
 
@@ -359,7 +364,8 @@ class BatchParameterShiftGradient(Gradient):
         else:
             val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
                                  self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
-                                 num_gpus=1, shots_mode=self.shots_mode)
+                                 num_gpus=1, shots_mode=self.shots_mode,
+                                 active_params=self.active_params)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
 
@@ -382,6 +388,7 @@ def batch_gradient(
         measure_method: MeasureMethod,
         num_gpus: int | None = None,
         shots_mode: str = 'total',
+        active_params: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Memory-frugal parameter-shift gradient.
@@ -394,7 +401,7 @@ def batch_gradient(
     with torch.no_grad():
         device = circuit.device
         P      = params.numel()
-        grad   = torch.empty(P, device=device, dtype=torch.float32)
+        grad   = torch.zeros(P, device=device, dtype=torch.float32)
         base   = params.detach().to(device).unsqueeze(0)  # (1, P)
 
         if is_partial:
@@ -463,32 +470,26 @@ def batch_gradient(
             torch.cuda.empty_cache()
             print(f"[TREV] All workers done, grad copied to {device}", flush=True)
         else:
-            # Build checkpoints from base theta for prefix reuse
-            param_to_op = circuit.get_param_to_op_map()
-            _, checkpoints = circuit.build_tensor_with_checkpoints(params.detach().to(device))
+            # Determine which params to shift
+            if active_params is not None:
+                shift_indices = active_params  # 1-D tensor of active param indices
+            else:
+                shift_indices = torch.arange(P, device=device)
+            A = shift_indices.numel()
 
-            # Use ~10 splits to balance checkpoint savings vs call overhead
-            n_splits = min(10, P)
-            ckpt_chunk = max(1, P // n_splits)
-            effective_chunk = min(chunk_size, ckpt_chunk)
-
-            for start in range(0, P, effective_chunk):
-                stop = min(start + effective_chunk, P)
+            # Process all active params in chunks
+            for start in range(0, A, chunk_size):
+                stop = min(start + chunk_size, A)
                 C = stop - start
-                idx = torch.arange(start, stop, device=device)
+                idx = shift_indices[start:stop]
                 arange_C = torch.arange(C, device=device)
 
                 batch = base.expand(2 * C, -1).clone()  # (2C, P)
                 batch[arange_C, idx] += shift
                 batch[C + arange_C, idx] -= shift
 
-                # Find earliest op containing any param in this chunk
-                earliest_op = min(param_to_op.get(p, 0) for p in range(start, stop))
-                ring_tensor = circuit.build_tensor_batch_from(batch, 2 * C, earliest_op, checkpoints[earliest_op])
-
-                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
-                grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                del ring_tensor
+                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
+                grad[idx] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         return grad
 
 def expectation_value_batch(

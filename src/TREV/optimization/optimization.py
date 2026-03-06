@@ -51,6 +51,15 @@ def minimize(
         optim = optimizer.get_optimizer([theta])
         lr = optimizer.args['lr']
 
+        # When optimizing in a subspace, only shift TREV params that
+        # actually affect the subspace gradient (non-zero Jacobian rows).
+        if param_mapping is not None and hasattr(gradient, 'active_params'):
+            active_mask = param_mapping.abs().sum(dim=1) > 1e-10
+            active_idx = torch.where(active_mask)[0].to(circuit.device)
+            gradient.active_params = active_idx
+            print(f"[TREV] Subspace active params: {active_idx.numel()}/{param_mapping.shape[0]} "
+                  f"({100*active_idx.numel()/param_mapping.shape[0]:.0f}%)", flush=True)
+
         exp_values = []
         best_result = []
         iteration_times = []
