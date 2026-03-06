@@ -111,6 +111,7 @@ def minimize(
 
             # --- best result method ---
             _t0 = time.time()
+            _tensor = circuit.build_tensor(full_theta)
             if best_value_method == 'highest_probability':
                 best_result.append(
                     get_value_of_highest_probability(_tensor, circuit.device)
