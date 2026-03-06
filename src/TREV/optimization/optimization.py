@@ -96,39 +96,35 @@ def minimize(
             if param_mapping is not None:
                 full_theta = param_base + param_mapping @ theta
 
-            # --- expectation value ---
+            # Build tensor once for both exp_value and best_result
             _t0 = time.time()
+            _tensor = circuit.build_tensor(full_theta)
+
+            # --- expectation value ---
             shots = getattr(gradient, 'shots', None)
             if shots is not None:
-                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method, int(shots))
+                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method, int(shots), ring_tensor=_tensor)
             else:
-                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method)
+                exp_value = circuit.get_expectation_value(full_theta, hamiltonian, gradient.measure_method, ring_tensor=_tensor)
             _t_exp = time.time() - _t0
             exp_values.append(exp_value.item() if isinstance(exp_value, torch.Tensor) else exp_value)
 
             # --- best result method ---
             _t0 = time.time()
             if best_value_method == 'highest_probability':
-                _tensor = circuit.build_tensor(full_theta)
                 best_result.append(
                     get_value_of_highest_probability(_tensor, circuit.device)
                 )
-                del _tensor
             elif best_value_method == 'argmax_tr_noinv_BE':
-                _tensor = circuit.build_tensor(full_theta)
                 best_result.append(
                     argmax_bitstring_tr_right_suffix(_tensor)
                 )
-                del _tensor
             elif best_value_method == 'full_contraction':
-                _tensor = circuit.build_tensor(full_theta)
                 best_idx = contract_tensor_ring(_tensor).abs().pow(2).argmax().item()
-                del _tensor
                 num_qubits = circuit.num_qubit
                 best_bitstring = format(best_idx, f'0{num_qubits}b')
                 best_result.append(best_bitstring[::-1])
             else:
-                _tensor = circuit.build_tensor(full_theta)
                 if gradient.measure_method in [MeasureMethod.PERFECT_SAMPLING]:
                     best_result.append(
                         get_value_of_highest_probability(_tensor, circuit.device)
@@ -144,7 +140,7 @@ def minimize(
                 else:
                     del _tensor
                     raise NotImplementedError()
-                del _tensor
+            del _tensor
             _t_best = time.time() - _t0
 
             #print(f"\n[TREV] Epoch {epoch}: grad={_t_grad:.2f}s, exp_value={_t_exp:.2f}s, best_result={_t_best:.2f}s", flush=True)
