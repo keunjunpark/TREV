@@ -15,20 +15,12 @@ SVD_THRESHOLD: float = 0.0
 UPCAST_SVD: bool = False
 
 def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
-    """Compute a rank-k SVD. Uses randomized lowrank when rank < min(m, n).
+    """Compute SVD, returning (U, S, Vh).
 
-    Returns (U, S, Vh) matching torch.linalg.svd convention.
+    Always uses full SVD via torch.linalg.svd (cuSOLVER on GPU).
+    Randomized svd_lowrank is slower when rank ~ n/2 due to overhead.
     """
-    m, n = matrix.shape[-2], matrix.shape[-1]
-    k = min(rank, m, n)
-    if k >= min(m, n):
-        return torch.linalg.svd(matrix, full_matrices=False)
-    try:
-        u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
-        return u, s, v.mH
-    except Exception as e:
-        print(f"[TREV] svd_lowrank failed ({e}), falling back to full SVD")
-        return torch.linalg.svd(matrix, full_matrices=False)
+    return torch.linalg.svd(matrix, full_matrices=False)
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
