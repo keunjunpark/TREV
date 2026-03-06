@@ -49,11 +49,14 @@ def measure(tensor: torch.Tensor, shots:float|int, device:str=None):
         prob_dist[int(key)]+=increment
     return prob_dist
 
-def expectation_value(tensor:torch.Tensor, hamiltonian: Hamiltonian, shot:float = 1e4,device:str = None):
+def expectation_value(tensor:torch.Tensor, hamiltonian: Hamiltonian, shot:float = 1e4,device:str = None, shots_mode:str = 'total'):
     groups = hamiltonian.get_qwc_groups()
     op_tensor = hamiltonian.get_pauli_op_tensor().to(device=device)  # (T, N) uint8
     all_coeffs = hamiltonian.coefficients
-    shots_per_group = max(1, int(shot) // len(groups))
+    if shots_mode == 'per_group':
+        shots_per_group = int(shot)
+    else:
+        shots_per_group = max(1, int(shot) // len(groups))
 
     q0 = torch.tensor([[1], [0]], dtype=torch.cfloat).to(device)
     q1 = torch.tensor([[0], [1]], dtype=torch.cfloat).to(device)

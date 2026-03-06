@@ -36,18 +36,18 @@ def _gpu_info(device: torch.device) -> str:
         return name
 
 
-def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method):
+def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method, shots_mode='total'):
     """Route to the correct batched expectation value backend."""
     if circuit.qubit_perm is not None:
         hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
     if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
         return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots)
     elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-        return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots)
+        return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
     elif measure_method == MeasureMethod.PERFECT_SAMPLING:
-        return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
     else:
-        return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
 
 
 def _get_gpu_count() -> int:
@@ -255,7 +255,7 @@ class _MultiGPUPool:
 
 
 class BatchParameterShiftGradient(Gradient):
-    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False, num_gpus: int | None = None):
+    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False, num_gpus: int | None = None, shots_mode: str = 'total'):
         super().__init__(measure_method)
         self.shift = shift
         self.batch_size = batch_size  # may be None
@@ -264,6 +264,9 @@ class BatchParameterShiftGradient(Gradient):
         self.curr_depth = 0
         self.is_partial = is_partial
         self._autotuned = False
+        # 'total': shots divided by groups (current — works for Z-only Hamiltonians)
+        # 'per_group': each group gets full `shots` budget (needed for chemistry)
+        self.shots_mode = shots_mode
 
         # Multi-GPU: auto-detect if None
         if num_gpus is None:
@@ -307,8 +310,16 @@ class BatchParameterShiftGradient(Gradient):
             self._autotuned = True
 
             if self._verbose:
+                # Report QWC group info
+                h = hamiltonian.permuted(circuit.qubit_perm) if circuit.qubit_perm is not None else hamiltonian
+                n_groups = len(h.get_qwc_groups())
+                if self.shots_mode == 'per_group':
+                    spg = self.shots
+                else:
+                    spg = max(1, self.shots // n_groups)
                 gpu_msg = f"[TREV] Auto batch_size selected: {self.batch_size} " \
                           f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
+                gpu_msg += f"\n[TREV] QWC groups: {n_groups}, shots_mode='{self.shots_mode}', shots_per_group={spg}"
                 if self._num_gpus > 1:
                     gpu_msg += f"\n[TREV] Multi-GPU enabled: {self._num_gpus} GPUs"
                 print(gpu_msg + "\n", flush=True)
@@ -328,7 +339,7 @@ class BatchParameterShiftGradient(Gradient):
         else:
             val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
                                  self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
-                                 num_gpus=1)
+                                 num_gpus=1, shots_mode=self.shots_mode)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
 
@@ -350,6 +361,7 @@ def batch_gradient(
         is_partial:bool,
         measure_method: MeasureMethod,
         num_gpus: int | None = None,
+        shots_mode: str = 'total',
 ) -> torch.Tensor:
     """
     Memory-frugal parameter-shift gradient.
@@ -378,7 +390,7 @@ def batch_gradient(
             batch[arange_C, idx] += shift
             batch[C + arange_C, idx] -= shift
 
-            exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
+            exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
             grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         elif num_gpus is not None and num_gpus > 1 and P > 0:
             # --- Multi-GPU path (multiprocessing to avoid GIL) ---
@@ -441,7 +453,7 @@ def batch_gradient(
                 batch[arange_C, idx] += shift
                 batch[C + arange_C, idx] -= shift
 
-                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
+                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
                 grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         return grad
 
@@ -450,7 +462,8 @@ def expectation_value_batch(
     circuit: Circuit,
     hamiltonian: Hamiltonian,
     shots: int,
-    seed: int | None = None
+    seed: int | None = None,
+    shots_mode: str = 'total',
 ) -> torch.Tensor:
     """
     Fully parallel run_circuit with batched parameter inputs.
@@ -474,7 +487,10 @@ def expectation_value_batch(
         groups = hamiltonian.get_qwc_groups()
         op_tensor = hamiltonian.get_pauli_op_tensor().to(device=device)
         all_coeffs = hamiltonian.coefficients
-        shots_per_group = max(1, shots // len(groups))
+        if shots_mode == 'per_group':
+            shots_per_group = shots
+        else:
+            shots_per_group = max(1, shots // len(groups))
 
         q0 = torch.tensor([[1], [0]], dtype=torch.cfloat, device=device)
         q1 = torch.tensor([[0], [1]], dtype=torch.cfloat, device=device)
@@ -749,6 +765,7 @@ def expectation_value_batch_right_suffix(
     param_chunk: Optional[int] = None,   # split B into chunks to fit memory
     normalize_every: int = 8,            # periodic normalization of X for stability
     use_complex64: bool = True,          # internal complex precision
+    shots_mode: str = 'total',
 ) -> torch.Tensor:
     """
     Batched Monte Carlo ⟨ψ(θ)|H|ψ(θ)⟩ via right-suffix sampling.
@@ -773,7 +790,10 @@ def expectation_value_batch_right_suffix(
     op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
     all_coeffs = hamiltonian.coefficients
     N = op_tensor.shape[1]
-    shots_per_group = max(1, shots // len(groups))
+    if shots_mode == 'per_group':
+        shots_per_group = shots
+    else:
+        shots_per_group = max(1, shots // len(groups))
 
     # RNG
     gen = torch.Generator(device=device)

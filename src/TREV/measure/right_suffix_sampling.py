@@ -52,13 +52,17 @@ def precompute_double_layer_and_right_suffix(cores):
 
 @torch.no_grad()
 def expectation_value(
-    cores, hamiltonian, shots=10_000, chunk_size=128, term_chunk=4096, seed=None
+    cores, hamiltonian, shots=10_000, chunk_size=128, term_chunk=4096, seed=None,
+    shots_mode='total',
 ):
     groups = hamiltonian.get_qwc_groups()
     op_tensor = hamiltonian.get_pauli_op_tensor().to(cores[0].device)  # (T, N) uint8
     all_coeffs = hamiltonian.coefficients
     n = len(cores)
-    shots_per_group = max(1, shots // len(groups))
+    if shots_mode == 'per_group':
+        shots_per_group = shots
+    else:
+        shots_per_group = max(1, shots // len(groups))
     device = cores[0].device
     cdtype = cores[0].dtype
 
@@ -153,6 +157,7 @@ def expectation_value_batch(
     param_chunk: Optional[int] = None,   # split B into chunks to fit memory
     normalize_every: int = 8,            # periodic normalization of X for stability
     use_complex64: bool = True,          # internal complex precision
+    shots_mode: str = 'total',
 ) -> torch.Tensor:
     """
     Batched Monte Carlo ⟨ψ(θ)|H|ψ(θ)⟩ via right-suffix sampling.
@@ -177,7 +182,10 @@ def expectation_value_batch(
     op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
     all_coeffs = hamiltonian.coefficients
     N = op_tensor.shape[1]
-    shots_per_group = max(1, shots // len(groups))
+    if shots_mode == 'per_group':
+        shots_per_group = shots
+    else:
+        shots_per_group = max(1, shots // len(groups))
 
     # RNG
     gen = torch.Generator(device=device)
