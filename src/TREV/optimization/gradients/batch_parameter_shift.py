@@ -89,18 +89,40 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, sho
     base_dev = base_cpu.to(device)
 
     try:
+        # Build checkpoints once for prefix reuse
+        param_to_op = circuit_clone.get_param_to_op_map()
+        base_params = base_dev.squeeze(0)  # (P,)
+        _, checkpoints = circuit_clone.build_tensor_with_checkpoints(base_params)
+
+        # Collect all param indices from ranges and group by op
+        all_params = []
         for start, stop in ranges:
-            C = stop - start
-            idx = torch.arange(start, stop, device=device)
-            arange_C = torch.arange(C, device=device)
+            all_params.extend(range(start, stop))
+        op_to_params = {}
+        for p_idx in all_params:
+            op_idx = param_to_op.get(p_idx, 0)
+            if op_idx not in op_to_params:
+                op_to_params[op_idx] = []
+            op_to_params[op_idx].append(p_idx)
 
-            batch = base_dev.expand(2 * C, -1).clone()
-            batch[arange_C, idx] += shift
-            batch[C + arange_C, idx] -= shift
+        for op_idx in sorted(op_to_params.keys()):
+            param_list = op_to_params[op_idx]
+            for i in range(0, len(param_list), chunk_size):
+                sub = param_list[i:i + chunk_size]
+                C = len(sub)
+                idx = torch.tensor(sub, device=device)
+                arange_C = torch.arange(C, device=device)
 
-            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
-            grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-            grad_shared[start:stop] = grad_slice.cpu()
+                batch = base_dev.expand(2 * C, -1).clone()
+                batch[arange_C, idx] += shift
+                batch[C + arange_C, idx] -= shift
+
+                ring_tensor = circuit_clone.build_tensor_batch_from(batch, 2 * C, op_idx, checkpoints[op_idx])
+                exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
+                grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                for j, p_idx in enumerate(sub):
+                    grad_shared[p_idx] = grad_slice[j].cpu()
+                del ring_tensor
     except Exception as e:
         print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
         traceback.print_exc()
@@ -121,6 +143,7 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
     import traceback
     device = f'cuda:{gpu_id}'
     circuit_clone = circuit_cpu.to_device(device)
+    param_to_op = circuit_clone.get_param_to_op_map()
 
     try:
         while not shutdown_event.is_set():
@@ -137,19 +160,42 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                 P = base_shared.shape[0]
                 base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
 
+                # Build checkpoints once per iteration for prefix reuse
+                base_params = base_shared.to(device)  # (P,)
+                _, checkpoints = circuit_clone.build_tensor_with_checkpoints(base_params)
+
+                # Collect all param indices from ranges and group by op
+                all_params = []
                 for start, stop in ranges:
-                    C = stop - start
-                    idx = torch.arange(start, stop, device=device)
-                    arange_C = torch.arange(C, device=device)
+                    all_params.extend(range(start, stop))
+                op_to_params = {}
+                for p_idx in all_params:
+                    op_idx = param_to_op.get(p_idx, 0)
+                    if op_idx not in op_to_params:
+                        op_to_params[op_idx] = []
+                    op_to_params[op_idx].append(p_idx)
 
-                    batch = base_dev.expand(2 * C, -1).clone()
-                    batch[arange_C, idx] += shift
-                    batch[C + arange_C, idx] -= shift
+                for op_idx in sorted(op_to_params.keys()):
+                    param_list = op_to_params[op_idx]
+                    for i in range(0, len(param_list), chunk_size):
+                        sub = param_list[i:i + chunk_size]
+                        C = len(sub)
+                        idx = torch.tensor(sub, device=device)
+                        arange_C = torch.arange(C, device=device)
 
-                    exp_vals = _dispatch_expectation(
-                        batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
-                    grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                    grad_shared[start:stop] = grad_slice.cpu()
+                        batch = base_dev.expand(2 * C, -1).clone()
+                        batch[arange_C, idx] += shift
+                        batch[C + arange_C, idx] -= shift
+
+                        ring_tensor = circuit_clone.build_tensor_batch_from(batch, 2 * C, op_idx, checkpoints[op_idx])
+                        exp_vals = _dispatch_expectation(
+                            batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
+                        grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                        for j, p_idx in enumerate(sub):
+                            grad_shared[p_idx] = grad_slice[j].cpu()
+                        del ring_tensor
+
+                del checkpoints
             except Exception as e:
                 print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
                 traceback.print_exc()
@@ -447,23 +493,30 @@ def batch_gradient(
             param_to_op = circuit.get_param_to_op_map()
             _, checkpoints = circuit.build_tensor_with_checkpoints(params.detach().to(device))
 
-            for start in range(0, P, chunk_size):
-                stop   = min(start + chunk_size, P)
-                C      = stop - start
-                idx    = torch.arange(start, stop, device=device)
-                arange_C = torch.arange(C, device=device)
+            # Group parameters by their op index so each group shares a checkpoint
+            op_to_params = {}
+            for p_idx in range(P):
+                op_idx = param_to_op.get(p_idx, 0)
+                if op_idx not in op_to_params:
+                    op_to_params[op_idx] = []
+                op_to_params[op_idx].append(p_idx)
 
-                batch = base.expand(2 * C, -1).clone()  # (2C, P)
-                batch[arange_C, idx] += shift
-                batch[C + arange_C, idx] -= shift
+            for op_idx in sorted(op_to_params.keys()):
+                param_list = op_to_params[op_idx]
+                for i in range(0, len(param_list), chunk_size):
+                    sub = param_list[i:i + chunk_size]
+                    C = len(sub)
+                    idx = torch.tensor(sub, device=device)
+                    arange_C = torch.arange(C, device=device)
 
-                # Find earliest op containing any param in this chunk
-                earliest_op = min(param_to_op.get(p, 0) for p in range(start, stop))
-                ring_tensor = circuit.build_tensor_batch_from(batch, 2 * C, earliest_op, checkpoints[earliest_op])
+                    batch = base.expand(2 * C, -1).clone()  # (2C, P)
+                    batch[arange_C, idx] += shift
+                    batch[C + arange_C, idx] -= shift
 
-                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
-                grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                del ring_tensor
+                    ring_tensor = circuit.build_tensor_batch_from(batch, 2 * C, op_idx, checkpoints[op_idx])
+                    exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
+                    grad[idx] = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                    del ring_tensor
         return grad
 
 def expectation_value_batch(

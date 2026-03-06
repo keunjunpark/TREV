@@ -170,38 +170,43 @@ class Circuit(torch.nn.Module):
     def build_tensor_with_checkpoints(self, theta: Tensor):
         """Forward pass saving tensor state before each compiled op.
 
+        Uses batch-mode operations (batch_size=1) internally so that
+        checkpoints are numerically consistent with build_tensor_batch_from.
+
         Returns (tensor, checkpoints) where checkpoints[i] is the tensor
-        state before ops[i] was applied.
+        state (N, chi, chi, 2) before ops[i] was applied.
         """
+        theta_batch = theta.unsqueeze(0)  # (1, P)
         tensor = torch.zeros((self.num_qubit, self.rank, self.rank, 2), dtype=self.cdtype, device=self.device)
         tensor[:, 0, 0, 0] = 1.0
+        tensor = tensor.unsqueeze(0)  # (1, N, chi, chi, 2)
 
         ops = self._compile_fused_ops()
         checkpoints = []
 
         for op_type, payload in ops:
-            checkpoints.append(tensor.clone())
+            checkpoints.append(tensor.squeeze(0).clone())
             if op_type == 'block1q':
                 for qubit, gates in payload.items():
                     fused = None
                     for gate in gates:
                         if isinstance(gate, ParameterMultiOneQubitGate):
-                            params = torch.stack([theta[i] for i in gate.theta_indices])
+                            params = torch.stack([theta_batch[:, i] for i in gate.theta_indices], dim=-1)
                             mat = gate.matrix_fun(params, self.device)
                         elif gate.has_parameter():
-                            mat = gate.matrix_fun(theta[gate.theta_index], self.device)
+                            mat = gate.matrix_fun(theta_batch[:, gate.theta_index], self.device)
                         else:
-                            mat = gate.matrix_fun(None, self.device)
+                            mat = gate.matrix_fun(1, self.device)
                         if mat.dtype != self.cdtype:
                             mat = mat.to(self.cdtype)
-                        fused = mat if fused is None else torch.mm(mat, fused)
-                    tensor[qubit] = _apply_single_qubit_gate(fused, tensor[qubit])
+                        fused = mat if fused is None else torch.bmm(mat, fused)
+                    tensor[:, qubit] = _apply_single_qubit_gate_batch(fused, tensor[:, qubit])
             elif op_type == 'p2q':
-                payload.apply(theta, tensor)
+                payload.apply_batch(theta_batch, 1, tensor)
             else:  # '2q'
-                payload.apply(tensor)
+                payload.apply_batch(1, tensor)
 
-        return tensor, checkpoints
+        return tensor.squeeze(0), checkpoints
 
     def build_tensor_batch_from(self, theta_batch: Tensor, batch_size: int, start_op: int, checkpoint: Tensor):
         """Batched forward pass starting from a checkpoint at compiled op start_op.
