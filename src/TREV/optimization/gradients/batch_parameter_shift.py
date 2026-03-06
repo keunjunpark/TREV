@@ -307,7 +307,7 @@ class BatchParameterShiftGradient(Gradient):
         # optional: control printing via env var
         self._verbose = True
 
-    def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
+    def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian, return_base_exp: bool = False):
         if (self.batch_size is None) and (not self._autotuned):
             device = torch.device(circuit.device) if isinstance(circuit.device, str) else circuit.device
             P = theta.numel()
@@ -371,7 +371,8 @@ class BatchParameterShiftGradient(Gradient):
             val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
                                  self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
                                  num_gpus=1, shots_mode=self.shots_mode,
-                                 active_params=self.active_params)
+                                 active_params=self.active_params,
+                                 return_base_exp=return_base_exp)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
 
@@ -395,14 +396,17 @@ def batch_gradient(
         num_gpus: int | None = None,
         shots_mode: str = 'total',
         active_params: torch.Tensor | None = None,
-) -> torch.Tensor:
+        return_base_exp: bool = False,
+) -> torch.Tensor | tuple:
     """
     Memory-frugal parameter-shift gradient.
 
     params   : (P,)  -- single circuit's parameters
     chunk_size  : how many theta-indices to shift at once
     num_gpus : number of GPUs to use (None or <=1 for single-GPU)
-    returns     : (P,)  -- gradient d<O>/d_theta
+    return_base_exp : if True, include unshifted theta in the batch and
+                      return (grad, base_exp_value) instead of just grad.
+    returns     : (P,) gradient, or (grad, base_exp) if return_base_exp=True
     """
     with torch.no_grad():
         device = circuit.device
@@ -485,6 +489,7 @@ def batch_gradient(
             else:
                 shift_indices = torch.arange(P, device=device)
             A = shift_indices.numel()
+            base_exp_value = None
 
             # Process all active params in chunks
             for start in range(0, A, chunk_size):
@@ -493,12 +498,26 @@ def batch_gradient(
                 idx = shift_indices[start:stop]
                 arange_C = torch.arange(C, device=device)
 
-                batch = base.expand(2 * C, -1).clone()  # (2C, P)
-                batch[arange_C, idx] += shift
-                batch[C + arange_C, idx] -= shift
+                if return_base_exp and start == 0:
+                    # Include unshifted theta as last row of the batch
+                    batch = base.expand(2 * C + 1, -1).clone()  # (2C+1, P)
+                    batch[arange_C, idx] += shift
+                    batch[C + arange_C, idx] -= shift
+                    # last row is unshifted base
 
-                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
-                grad[idx] = (0.5 * (exp_vals[:C] - exp_vals[C:])).float()
+                    exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
+                    grad[idx] = (0.5 * (exp_vals[:C] - exp_vals[C:2*C])).float()
+                    base_exp_value = exp_vals[-1]
+                else:
+                    batch = base.expand(2 * C, -1).clone()  # (2C, P)
+                    batch[arange_C, idx] += shift
+                    batch[C + arange_C, idx] -= shift
+
+                    exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
+                    grad[idx] = (0.5 * (exp_vals[:C] - exp_vals[C:])).float().to(grad.device)
+
+        if return_base_exp:
+            return grad, base_exp_value
         return grad
 
 def expectation_value_batch(
