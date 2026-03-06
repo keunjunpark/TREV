@@ -36,18 +36,18 @@ def _gpu_info(device: torch.device) -> str:
         return name
 
 
-def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method, shots_mode='total'):
+def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method, shots_mode='total', ring_tensor=None):
     """Route to the correct batched expectation value backend."""
     if circuit.qubit_perm is not None:
         hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
     if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-        return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots)
+        return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots, ring_tensor=ring_tensor)
     elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-        return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
+        return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode, ring_tensor=ring_tensor)
     elif measure_method == MeasureMethod.PERFECT_SAMPLING:
-        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode, ring_tensor=ring_tensor)
     else:
-        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode)
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots, shots_mode=shots_mode, ring_tensor=ring_tensor)
 
 
 def _get_gpu_count() -> int:
@@ -443,6 +443,10 @@ def batch_gradient(
             torch.cuda.empty_cache()
             print(f"[TREV] All workers done, grad copied to {device}", flush=True)
         else:
+            # Build checkpoints from base theta for prefix reuse
+            param_to_op = circuit.get_param_to_op_map()
+            _, checkpoints = circuit.build_tensor_with_checkpoints(params.detach().to(device))
+
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
                 C      = stop - start
@@ -453,8 +457,13 @@ def batch_gradient(
                 batch[arange_C, idx] += shift
                 batch[C + arange_C, idx] -= shift
 
-                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
+                # Find earliest op containing any param in this chunk
+                earliest_op = min(param_to_op.get(p, 0) for p in range(start, stop))
+                ring_tensor = circuit.build_tensor_batch_from(batch, 2 * C, earliest_op, checkpoints[earliest_op])
+
+                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode, ring_tensor=ring_tensor)
                 grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                del ring_tensor
         return grad
 
 def expectation_value_batch(
@@ -464,6 +473,7 @@ def expectation_value_batch(
     shots: int,
     seed: int | None = None,
     shots_mode: str = 'total',
+    ring_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fully parallel run_circuit with batched parameter inputs.
@@ -481,7 +491,7 @@ def expectation_value_batch(
         if device == 'cuda':
             torch.cuda.synchronize()
 
-        ring_tensor_batch = circuit.build_tensor_batch(param_batch, B)
+        ring_tensor_batch = ring_tensor if ring_tensor is not None else circuit.build_tensor_batch(param_batch, B)
         B, N = ring_tensor_batch.shape[:2]
 
         groups = hamiltonian.get_qwc_groups()
@@ -639,6 +649,7 @@ def expectation_value_batch_efficient_contraction(
     cache_double_layers: bool = True,    # cache A0/A1 per site
     param_chunk: Optional[int] = None,   # split B across chunks to fit memory
     use_complex64: bool = True,          # internal complex precision
+    ring_tensor: Tensor | None = None,   # pre-built tensor ring (B,N,l,r,2)
 ) -> Tensor:
     """
     Exact batched <psi|H|psi> via identity-chain factored Kronecker contraction.
@@ -670,7 +681,7 @@ def expectation_value_batch_efficient_contraction(
         B = int(param_view.shape[0])
 
         # Build cores
-        ring = circuit.build_tensor_batch(param_view, B).to(device)  # (B,N,l,r,2)
+        ring = (ring_tensor[lo:hi] if ring_tensor is not None else circuit.build_tensor_batch(param_view, B)).to(device)  # (B,N,l,r,2)
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
         if use_complex64:
@@ -766,6 +777,7 @@ def expectation_value_batch_right_suffix(
     normalize_every: int = 8,            # periodic normalization of X for stability
     use_complex64: bool = True,          # internal complex precision
     shots_mode: str = 'total',
+    ring_tensor: torch.Tensor | None = None,  # pre-built tensor ring (B,N,χ,χ,2)
 ) -> torch.Tensor:
     """
     Batched Monte Carlo ⟨ψ(θ)|H|ψ(θ)⟩ via right-suffix sampling.
@@ -805,7 +817,7 @@ def expectation_value_batch_right_suffix(
     for lo, hi in batch_slices:
         param_view = param_batch[lo:hi]
         B = int(param_view.shape[0])
-        ring = circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
+        ring = ring_tensor[lo:hi] if ring_tensor is not None else circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
         if use_complex64:
             ctype = ring.dtype if ring.is_complex() else torch.cfloat
         else:
