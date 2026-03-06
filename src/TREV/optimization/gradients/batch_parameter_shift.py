@@ -106,7 +106,7 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, sho
 
             exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
             grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-            grad_shared[idx.cpu()] = grad_slice.cpu()
+            grad_shared[idx.cpu()] = grad_slice.cpu().float()
     except Exception as e:
         print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
         traceback.print_exc()
@@ -161,7 +161,7 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                     exp_vals = _dispatch_expectation(
                         batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
                     grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
-                    grad_shared[idx.cpu()] = grad_slice.cpu()
+                    grad_shared[idx.cpu()] = grad_slice.cpu().float()
             except Exception as e:
                 print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
                 traceback.print_exc()
