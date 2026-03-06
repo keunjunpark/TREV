@@ -15,13 +15,20 @@ SVD_THRESHOLD: float = 0.0
 UPCAST_SVD: bool = False
 
 def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
-    """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
-    m, n = matrix.shape
+    """Compute a rank-k SVD. Uses randomized lowrank when rank < min(m, n).
+
+    Returns (U, S, Vh) matching torch.linalg.svd convention.
+    """
+    m, n = matrix.shape[-2], matrix.shape[-1]
     k = min(rank, m, n)
-    #if k == min(m, n):
-    return torch.linalg.svd(matrix, full_matrices=False)
-    # u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
-    # return u, s, v.mH
+    if k >= min(m, n):
+        return torch.linalg.svd(matrix, full_matrices=False)
+    try:
+        u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
+        return u, s, v.mH
+    except Exception as e:
+        print(f"[TREV] svd_lowrank failed ({e}), falling back to full SVD")
+        return torch.linalg.svd(matrix, full_matrices=False)
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
@@ -71,11 +78,12 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     mps = torch.moveaxis(mps, 1, 2).reshape((chi_1 * 2, chi_3 * 2))
     # mps: 2 × χ1 × 2 × χ3 --> (2 * χ1) × (2 * χ3)
 
-    u, s, v = torch.linalg.svd(mps)
+    trunc_rank = max(chi_1, chi_3)
+    u, s, vh = _truncated_svd(mps, trunc_rank)
     # Zero out noise singular values to prevent accumulation at high rank
     if SVD_THRESHOLD > 0:
         s = torch.where(s > s[0] * SVD_THRESHOLD, s, torch.zeros_like(s))
-    x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).to(dtype=mps.dtype), v[:chi_3, :]
+    x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).to(dtype=mps.dtype), vh[:chi_3, :]
     qu0 = torch.mm(x, sx).reshape((2, chi_1, chi_1))
     qu1 = y.reshape((chi_3, 2, chi_3))
 
@@ -128,7 +136,8 @@ def  _apply_double_qubit_gate_batch(
 
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
-    u, s, vh = torch.linalg.svd(mps)
+    trunc_rank = max(chi1, chi3)
+    u, s, vh = _truncated_svd(mps, trunc_rank)
     # Zero out noise singular values to prevent accumulation at high rank
     if SVD_THRESHOLD > 0:
         threshold = s[:, 0:1] * SVD_THRESHOLD

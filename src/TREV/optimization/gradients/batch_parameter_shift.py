@@ -81,7 +81,7 @@ def _distribute_params_evenly(P, num_gpus, chunk_size):
 
 
 def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, shots,
-                  measure_method, chunk_size, grad_shared):
+                  measure_method, chunk_size, grad_shared, shots_mode='total'):
     """Multiprocessing worker: compute gradient slices on assigned GPU."""
     import traceback
     device = f'cuda:{gpu_id}'
@@ -98,7 +98,7 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, sho
             batch[arange_C, idx] += shift
             batch[C + arange_C, idx] -= shift
 
-            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
             grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
             grad_shared[start:stop] = grad_slice.cpu()
     except Exception as e:
@@ -112,7 +112,7 @@ def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, sho
 def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                           measure_method, chunk_size,
                           base_shared, grad_shared, ranges_queue, done_barrier,
-                          shutdown_event):
+                          shutdown_event, shots_mode='total'):
     """Persistent process worker — stays alive across iterations.
 
     Waits for work on ranges_queue, computes, writes to grad_shared,
@@ -147,7 +147,7 @@ def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
                     batch[C + arange_C, idx] -= shift
 
                     exp_vals = _dispatch_expectation(
-                        batch, circuit_clone, hamiltonian, shots, measure_method)
+                        batch, circuit_clone, hamiltonian, shots, measure_method, shots_mode=shots_mode)
                     grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
                     grad_shared[start:stop] = grad_slice.cpu()
             except Exception as e:
@@ -171,7 +171,7 @@ class _MultiGPUPool:
     _active_pool = None  # class-level singleton — only one pool at a time
 
     def __init__(self, num_gpus, circuit, hamiltonian, shift, shots,
-                 measure_method, chunk_size, P):
+                 measure_method, chunk_size, P, shots_mode='total'):
         # Kill any previous pool first (e.g. from a different gradient object)
         if _MultiGPUPool._active_pool is not None:
             print("[TREV] Shutting down previous multi-GPU pool", flush=True)
@@ -202,7 +202,7 @@ class _MultiGPUPool:
                       measure_method, chunk_size,
                       self.base_shared, self.grad_shared,
                       self.ranges_queues[gpu_id], self.done_barrier,
-                      self.shutdown_event),
+                      self.shutdown_event, shots_mode),
             )
             p.daemon = True
             p.start()
@@ -295,7 +295,7 @@ class BatchParameterShiftGradient(Gradient):
                 param_batch = base.expand(2 * C, -1).clone()
                 param_batch[arange_C, idx] += self.shift
                 param_batch[C + arange_C, idx] -= self.shift
-                _dispatch_expectation(param_batch, circuit, hamiltonian, self.shots, self.measure_method)
+                _dispatch_expectation(param_batch, circuit, hamiltonian, self.shots, self.measure_method, shots_mode=self.shots_mode)
 
             self.batch_size = auto_batch_size(
                 run_batch_fn,
@@ -332,7 +332,7 @@ class BatchParameterShiftGradient(Gradient):
                 self._gpu_pool = _MultiGPUPool(
                     self._num_gpus, circuit, hamiltonian,
                     self.shift, self.shots, self.measure_method,
-                    self.batch_size, theta.numel(),
+                    self.batch_size, theta.numel(), self.shots_mode,
                 )
             device = circuit.device
             val = self._gpu_pool.compute_gradient(theta, self.batch_size, device)
@@ -422,7 +422,7 @@ def batch_gradient(
                     target=_mp_worker_fn,
                     args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
                           hamiltonian, shift, shots, measure_method,
-                          chunk_size, grad_shared),
+                          chunk_size, grad_shared, shots_mode),
                 )
                 p.start()
                 print(f"[TREV] GPU {gpu_id} process started (PID {p.pid})", flush=True)
