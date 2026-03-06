@@ -498,7 +498,7 @@ def batch_gradient(
                 batch[C + arange_C, idx] -= shift
 
                 exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method, shots_mode=shots_mode)
-                grad[idx] = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                grad[idx] = (0.5 * (exp_vals[:C] - exp_vals[C:])).float()
         return grad
 
 def expectation_value_batch(
