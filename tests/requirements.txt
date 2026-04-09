@@ -1,0 +1,16 @@
+# Test requirements for TREV
+
+# Core testing framework
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-xdist>=3.0.0  # For parallel test execution
+
+# Mocking and fixtures
+pytest-mock>=3.10.0
+
+# Core dependencies (should match main requirements)
+torch>=1.10.0
+numpy>=1.21.0
+
+# Optional: for better test reports
+pytest-html>=3.1.0

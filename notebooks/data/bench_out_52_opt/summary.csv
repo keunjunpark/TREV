@@ -1,0 +1,12 @@
+run_id,method,N,depth,seed,theta_path,iter_csv,optimizer_name
+0cd940c7,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_0cd940c7.pt,bench_out_52_opt/iter_0cd940c7.csv,RMSprop_001
+d2ac37ab,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_d2ac37ab.pt,bench_out_52_opt/iter_d2ac37ab.csv,RMSprop_003
+67c71be0,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_67c71be0.pt,bench_out_52_opt/iter_67c71be0.csv,AdamW_001
+fe3c95e8,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_fe3c95e8.pt,bench_out_52_opt/iter_fe3c95e8.csv,AdamW_003
+51210bd6,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_51210bd6.pt,bench_out_52_opt/iter_51210bd6.csv,RMSprop_0005
+9e047115,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_9e047115.pt,bench_out_52_opt/iter_9e047115.csv,RMSprop_0001
+5398c868,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_5398c868.pt,bench_out_52_opt/iter_5398c868.csv,AdamW_0005
+969ddbd6,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_969ddbd6.pt,bench_out_52_opt/iter_969ddbd6.csv,AdamW_0001
+b4fe350d,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_b4fe350d.pt,bench_out_52_opt/iter_b4fe350d.csv,RMSprop_003_mom_c
+390d605e,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_390d605e.pt,bench_out_52_opt/iter_390d605e.csv,RMSprop_003_alpha90
+1fe51bfe,tr_correct_sampling,52,5,0,bench_out_52_opt/theta_1fe51bfe.pt,bench_out_52_opt/iter_1fe51bfe.csv,AdamW_002_betas0999

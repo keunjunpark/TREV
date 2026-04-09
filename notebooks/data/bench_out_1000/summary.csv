@@ -1,0 +1,3 @@
+run_id,method,N,depth,seed,theta_path,iter_csv
+a2eca9db,tr_efficient,1000,1,0,bench_out_1000/theta_a2eca9db.pt,bench_out_1000/iter_a2eca9db.csv
+ade1babb,tr_correct_sampling,1000,1,0,bench_out_1000/theta_ade1babb.pt,bench_out_1000/iter_ade1babb.csv

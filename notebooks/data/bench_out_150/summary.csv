@@ -1,0 +1,7 @@
+run_id,method,N,depth,seed,theta_path,iter_csv
+f8e7b46a,tr_correct_sampling,150,1,0,bench_out_150/theta_f8e7b46a.pt,bench_out_150/iter_f8e7b46a.csv
+b96adc26,tr_efficient,150,1,0,bench_out_150/theta_b96adc26.pt,bench_out_150/iter_b96adc26.csv
+099ffef0,tr_efficient,150,1,1,bench_out_150/theta_099ffef0.pt,bench_out_150/iter_099ffef0.csv
+dc2bd7af,tr_efficient,150,1,2,bench_out_150/theta_dc2bd7af.pt,bench_out_150/iter_dc2bd7af.csv
+701fb9c5,tr_correct_sampling,150,1,1,bench_out_150/theta_701fb9c5.pt,bench_out_150/iter_701fb9c5.csv
+08808c4e,tr_correct_sampling,150,1,2,bench_out_150/theta_08808c4e.pt,bench_out_150/iter_08808c4e.csv

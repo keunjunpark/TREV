@@ -1,0 +1,16 @@
+run_id,method,N,depth,seed,theta_path,iter_csv
+5c878e8f,tr_efficient,4,3,0,maxcut_comparison_CPU/theta_5c878e8f.pt,maxcut_comparison_CPU/iter_5c878e8f.csv
+9520ff0a,tr_correct_sampling,4,3,0,maxcut_comparison_CPU/theta_9520ff0a.pt,maxcut_comparison_CPU/iter_9520ff0a.csv
+71fb6b5e,tr_sampling,4,3,0,maxcut_comparison_CPU/theta_71fb6b5e.pt,maxcut_comparison_CPU/iter_71fb6b5e.csv
+48cac952,tr_efficient,8,3,0,maxcut_comparison_CPU/theta_48cac952.pt,maxcut_comparison_CPU/iter_48cac952.csv
+3dabec4f,tr_correct_sampling,8,3,0,maxcut_comparison_CPU/theta_3dabec4f.pt,maxcut_comparison_CPU/iter_3dabec4f.csv
+3591d8fc,tr_sampling,8,3,0,maxcut_comparison_CPU/theta_3591d8fc.pt,maxcut_comparison_CPU/iter_3591d8fc.csv
+fc4a0f8d,tr_efficient,16,3,0,maxcut_comparison_CPU/theta_fc4a0f8d.pt,maxcut_comparison_CPU/iter_fc4a0f8d.csv
+0cff6063,tr_correct_sampling,16,3,0,maxcut_comparison_CPU/theta_0cff6063.pt,maxcut_comparison_CPU/iter_0cff6063.csv
+b4245d05,tr_sampling,16,3,0,maxcut_comparison_CPU/theta_b4245d05.pt,maxcut_comparison_CPU/iter_b4245d05.csv
+128aa640,tr_efficient,24,3,0,maxcut_comparison_CPU/theta_128aa640.pt,maxcut_comparison_CPU/iter_128aa640.csv
+199ddae1,tr_correct_sampling,24,3,0,maxcut_comparison_CPU/theta_199ddae1.pt,maxcut_comparison_CPU/iter_199ddae1.csv
+3b76f60b,tr_sampling,24,3,0,maxcut_comparison_CPU/theta_3b76f60b.pt,maxcut_comparison_CPU/iter_3b76f60b.csv
+57e098ad,sv,4,3,0,maxcut_comparison_CPU/theta_57e098ad.pt,maxcut_comparison_CPU/iter_57e098ad.csv
+152caf8f,sv,8,3,0,maxcut_comparison_CPU/theta_152caf8f.pt,maxcut_comparison_CPU/iter_152caf8f.csv
+4c7240c7,sv,16,3,0,maxcut_comparison_CPU/theta_4c7240c7.pt,maxcut_comparison_CPU/iter_4c7240c7.csv
