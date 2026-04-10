@@ -292,8 +292,9 @@ def _dispatch_contraction(ring, circuit, hamiltonian, shots):
             temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
             r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
 
-            mi = mask[:, i].view(1, Tc, 1, 1).expand(B, Tc, chi2, chi2).reshape(BT, chi2, chi2)
-            Prod = torch.where(mi, r0 - r1, r0 + r1)
+            sign = torch.where(mask[:, i], -1.0, 1.0).to(ctype)
+            sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
+            Prod = r0 + sign * r1
 
         Prod = Prod.reshape(B, Tc, chi2, chi2)
         trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)
@@ -475,9 +476,12 @@ def expectation_value_batch_efficient_contraction(
             r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp)
             r1 = r1.reshape(BT, chi2, chi2)
 
-            # I: r0 + r1, Z: r0 - r1
-            mi = mask_i.view(1, Tc, 1, 1).expand(B, Tc, chi2, chi2).reshape(BT, chi2, chi2)
-            return torch.where(mi, r0 - r1, r0 + r1)
+            # I: r0 + r1, Z: r0 - r1. Use sign multiply instead of torch.where
+            # to avoid expanding bool mask to (BT, chi2, chi2).
+            # sign = +1.0 for I (mask=False), -1.0 for Z (mask=True)
+            sign = torch.where(mask_i, -1.0, 1.0).to(ctype)  # (Tc,)
+            sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
+            return r0 + sign * r1
 
         totals = torch.zeros(B, dtype=ctype, device=device)
 
