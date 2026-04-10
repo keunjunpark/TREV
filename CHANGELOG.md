@@ -9,6 +9,8 @@
 
 - **Batched correct sampling R_suf: O(chi^5)** — Applied same Kronecker factoring to `expectation_value_batch_correct_sampling` R_suf precompute, replacing `torch.bmm(Ei, acc)` with O(chi^5) matmuls. R_suf numerically identical (max err ~1e-8 in cfloat).
 
+- **Prefix caching for parameter-shift gradient** — Added `batch_gradient_cached` which caches tensor state before each parameter segment (separated by 2-qubit gates). Only replays gates from the segment onward for each shifted parameter. For HEA circuits: 1.3-1.75x gradient speedup. Automatically falls back to uncached path for circuits with small segments (QAOA-style).
+
 - **Faster SVD post-processing in 2-qubit gates** — Replaced `diag_embed(s) + bmm` with broadcast multiply (`x * s.unsqueeze()`) for absorbing singular values. Eliminates diagonal matrix allocation and batched matmul. ~7-37% speedup on `build_tensor_batch`.
 
 ### Fixed

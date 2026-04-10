@@ -164,6 +164,144 @@ def batch_gradient(
                 grad[start:stop] = 0.5 * (fwd - bwd)
         return grad
 
+
+def batch_gradient_cached(
+        params:     torch.Tensor,           # (P,)
+        circuit,
+        hamiltonian,
+        chunk_size: int,
+        shots: int,
+        shift: float,
+        measure_method: MeasureMethod,
+) -> torch.Tensor:
+    """
+    Parameter-shift gradient with prefix caching.
+
+    Caches the tensor state before each parameter segment (separated by 2q gates).
+    Only replays gates from the segment onward for each shifted parameter.
+    """
+    with torch.no_grad():
+        device = circuit.device
+        P = params.numel()
+        grad = torch.empty(P, device=device, dtype=torch.float32)
+
+        checkpoints = circuit.get_prefix_checkpoints()
+
+        # Only use caching for segments with enough params to justify prefix cost.
+        # Merge small segments into uncached runs.
+        MIN_SEG_SIZE = 4
+        cacheable = [(g, lo, hi) for g, (lo, hi) in checkpoints if (hi - lo) >= MIN_SEG_SIZE]
+
+        if not cacheable:
+            return batch_gradient(params, circuit, hamiltonian, chunk_size, shots,
+                                  shift, 1, 0, False, measure_method)
+
+        # Handle uncached params (small segments) with standard path
+        cached_params = set()
+        for _, lo, hi in cacheable:
+            cached_params.update(range(lo, hi))
+        uncached = sorted(set(range(P)) - cached_params)
+
+        if uncached:
+            for start in range(0, len(uncached), chunk_size):
+                stop = min(start + chunk_size, len(uncached))
+                idx = torch.tensor(uncached[start:stop], device=device)
+                C = len(idx)
+                base_rep = params.unsqueeze(0).repeat(C, 1)
+                plus = base_rep.clone()
+                minus = base_rep.clone()
+                plus[torch.arange(C), idx] += shift
+                minus[torch.arange(C), idx] -= shift
+                batch = torch.cat([plus, minus], dim=0)
+                if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
+                    exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
+                else:
+                    exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
+                fwd, bwd = exp_vals[:C], exp_vals[C:]
+                grad[idx] = 0.5 * (fwd - bwd)
+
+        for seg_gate_start, param_lo, param_hi in cacheable:
+            # Build prefix once for this segment (identical for all shifts)
+            prefix = circuit.build_prefix_batch(params, 1, seg_gate_start)
+
+            # Process params in this segment in chunks
+            for start in range(param_lo, param_hi, chunk_size):
+                stop = min(start + chunk_size, param_hi)
+                idx = torch.arange(start, stop, device=device)
+                C = len(idx)
+
+                base = params.unsqueeze(0)
+                plus = base.repeat(C, 1)
+                minus = plus.clone()
+                plus[torch.arange(C), idx] += shift
+                minus[torch.arange(C), idx] -= shift
+                batch = torch.cat([plus, minus], dim=0)  # (2C, P)
+                B = batch.shape[0]
+
+                # Build from cached prefix
+                prefix_exp = prefix.expand(B, -1, -1, -1, -1)
+                ring = circuit.build_from_prefix_batch(prefix_exp, batch, B, seg_gate_start)
+
+                # Contraction
+                if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
+                    exp_vals = _dispatch_contraction(ring, circuit, hamiltonian, shots)
+                else:
+                    exp_vals = _dispatch_contraction(ring, circuit, hamiltonian, shots)
+
+                fwd, bwd = exp_vals[:C], exp_vals[C:]
+                grad[start:stop] = 0.5 * (fwd - bwd)
+
+        return grad
+
+
+def _dispatch_contraction(ring, circuit, hamiltonian, shots):
+    """Run efficient contraction directly on pre-built ring tensor."""
+    B, N, chi, _, _ = ring.shape
+    ctype = torch.cfloat
+    device = ring.device
+
+    paulis = hamiltonian.get_bool_pauli_tensor().to(device)
+    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=ctype, device=device)
+    T, _ = paulis.shape
+
+    chi2 = chi * chi
+    A0_all = ring[..., 0].to(ctype)
+    A1_all = ring[..., 1].to(ctype)
+
+    totals = torch.zeros(B, dtype=ctype, device=device)
+
+    for t0 in range(0, T, T):  # single chunk
+        t1 = T
+        mask = paulis[t0:t1]
+        coefs = coeffs[t0:t1]
+        Tc = mask.size(0)
+        BT = B * Tc
+
+        eye = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(BT, -1, -1)
+        Prod = eye
+
+        for i in range(N):
+            A0_i = A0_all[:, i]
+            A1_i = A1_all[:, i]
+            A0_exp = A0_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+            A1_exp = A1_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+
+            Prod_4d = Prod.reshape(BT, chi2, chi, chi)
+            temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
+            r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
+            temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
+            r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
+
+            mi = mask[:, i].view(1, Tc, 1, 1).expand(B, Tc, chi2, chi2).reshape(BT, chi2, chi2)
+            Prod = torch.where(mi, r0 - r1, r0 + r1)
+
+        Prod = Prod.reshape(B, Tc, chi2, chi2)
+        trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)
+        totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
+
+    return totals.real.float()
+
+
 def expectation_value_batch(
     param_batch: torch.Tensor,
     circuit: Circuit,
