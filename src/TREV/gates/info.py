@@ -62,13 +62,17 @@ def RZ(theta, device:str=None):
     ], dim=-2).to(device).type(torch.cfloat)
     return rz if len(theta) > 1 else rz[0]
 
-def SWAP(device:str=None):
-    return torch.tensor([
+def SWAP(batch_size=None, device:str=None):
+    swap = torch.tensor([
         [1, 0, 0, 0],
         [0, 0, 1, 0],
         [0, 1, 0, 0],
         [0, 0, 0, 1]
     ], dtype=torch.cfloat).to(device)
+    if batch_size is None:
+        return swap
+    else:
+        return swap.unsqueeze(0).repeat(batch_size, 1, 1)
 
 def CNOT(batch_size=None, device:str=None):
     cnot=  torch.tensor([
