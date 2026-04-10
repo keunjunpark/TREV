@@ -53,13 +53,11 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     #  -- not technically necessary, unless chi values start off different
     #  -- not necessary right now, but a future-proofing good-to-have
 
-    # noinspection PyTypeChecker
-    x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).type(torch.cfloat), v[:chi_3, :]
-    # x: (2 * χ1) × χ1
-    # sx: χ1 × χ1
-    # y: χ3 × (2 * χ3)
+    x = u[:, :chi_1]                                   # (2χ1, χ1)
+    sc = s[:chi_1].unsqueeze(0).to(mps.dtype)           # (1, χ1)
+    y = v[:chi_3, :]                                    # (χ3, 2χ3)
 
-    qu0 = torch.mm(x, sx).reshape((2, chi_1, chi_1))
+    qu0 = (x * sc).reshape((2, chi_1, chi_1))
     # qu0: ((2 * χ1) × [χ1]) . ([χ1] × χ1) = (2 * χ1) × χ1 --> 2 × χ1 × χ1
     qu1 = y.reshape((chi_3, 2, chi_3))
     # qu1: χ3 × 2 × χ3
@@ -105,12 +103,13 @@ def  _apply_double_qubit_gate_batch(
 
     u, s, vh = torch.linalg.svd(mps, full_matrices=False)   # u: (B, 2χ1, r),  vh: (B, r, 2χ3)
 
-    # Keep the same number of singular vectors you did in the scalar path
+    # Truncate to chi and absorb singular values via broadcast multiply
+    # (avoids diag_embed + bmm overhead)
     x  = u[:, :, :chi1]                                     # (B, 2χ1, χ1)
-    sx = torch.diag_embed(s[:, :chi1]).to(torch.cfloat)      # (B, χ1,  χ1)
+    sc = s[:, :chi1].unsqueeze(1).to(mps.dtype)              # (B, 1, χ1)
     y  = vh[:, :chi3, :]                                     # (B, χ3, 2χ3)
 
-    qu0_new = torch.bmm(x, sx).reshape(B, 2, chi1, chi1).permute(0, 2, 3, 1)  # (B, χ1, χ1, 2)
+    qu0_new = (x * sc).reshape(B, 2, chi1, chi1).permute(0, 2, 3, 1)  # (B, χ1, χ1, 2)
     qu1_new = y.reshape(B, chi3, 2, chi3).permute(0, 1, 3, 2)  # (B, χ3, χ3, 2)
 
     return qu0_new, qu1_new

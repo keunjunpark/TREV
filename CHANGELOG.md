@@ -9,5 +9,7 @@
 
 - **Batched correct sampling R_suf: O(chi^5)** — Applied same Kronecker factoring to `expectation_value_batch_correct_sampling` R_suf precompute, replacing `torch.bmm(Ei, acc)` with O(chi^5) matmuls. R_suf numerically identical (max err ~1e-8 in cfloat).
 
+- **Faster SVD post-processing in 2-qubit gates** — Replaced `diag_embed(s) + bmm` with broadcast multiply (`x * s.unsqueeze()`) for absorbing singular values. Eliminates diagonal matrix allocation and batched matmul. ~7-37% speedup on `build_tensor_batch`.
+
 ### Fixed
 - **QAOA example in README** — Added ZZ entangling gates (CNOT-RZ-CNOT) and full MaxCut problem setup. Previous example had no entanglement.
