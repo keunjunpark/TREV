@@ -296,35 +296,50 @@ def expectation_value_batch_efficient_contraction(
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
         ctype = torch.complex64 if use_complex64 else torch.complex128
 
-        # Local ops
-        Z = torch.tensor([[1, 0], [0, -1]], dtype=ctype, device=device)
-        I = torch.eye(2, dtype=ctype, device=device)
+        chi = l
+        chi2 = chi * chi
 
-        ll = l * l
-        rr = r * r
+        # Cache per-site A0, A1 slices for Kronecker-factored contraction
+        A0_all = ring[..., 0].to(ctype)  # (B, N, chi, chi)
+        A1_all = ring[..., 1].to(ctype)  # (B, N, chi, chi)
 
-        def site_double_layers_matrix(Ab: Tensor):
+        def _kron_right_batch(Prod_flat, A0_i, A1_i, mask_i, Tc):
             """
-            Ab: (B,el,r,2)
-            Returns E_I, E_Z each (B, ll, rr) where rows index (l,l'), cols index (r,r').
-            We compute 5D then reshap immediately, NO caching of 5D tensors.
-            """
-            AO_I = torch.einsum('blrd,dk->blrk', Ab, I)  # (B,l,r,2)
-            AO_Z = torch.einsum('blrd,dk->blrk', Ab, Z)  # (B,l,r,2)
-            # Ei_5d(b,l,L,r,R) = sum_d Ab*[b,l,r,d] * AO_[b,L,R,d]
-            EI5 = torch.einsum('blrd,bLRd->blLrR', Ab.conj(), AO_I)
-            EZ5 = torch.einsum('blrd,bLRd->blLrR', Ab.conj(), AO_Z)
-            EI  = EI5.reshape(B, ll, rr).contiguous()
-            EZ  = EZ5.reshape(B, ll, rr).contiguous()
-            return EI, EZ
+            Kronecker-factored Prod @ E per term, O(chi^5) instead of O(chi^6).
 
-        # Optional cache of per-site matrices to avoid recompute across term-chunks
-        cached = None
-        if cache_double_layers:
-            cached = []
-            for i in range(N):
-                EI, EZ = site_double_layers_matrix(ring[:, i].to(ctype))
-                cached.append((EI, EZ))
+            Prod @ E where E = kron(conj(A0), A0) ± kron(conj(A1), A1)
+            E[bB, cC] = conj(A0[b,c]) * A0[B,C]  (I case, + for both)
+
+            Prod_flat: (B*Tc, chi^2, chi^2)
+            A0_i, A1_i: (B, chi, chi) — site matrices (left_bond, right_bond)
+            mask_i: (Tc,) bool — True=Z, False=I for each term
+
+            Returns: (B*Tc, chi^2, chi^2)
+            """
+            BT = B * Tc
+            A0_exp = A0_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+            A1_exp = A1_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+
+            # Prod: (BT, chi2, chi2) -> (BT, chi2, chi, chi) = (bt, aA, b, B)
+            # where aA = row index, (b, B) = col split into bra/ket right bonds
+            Prod_4d = Prod_flat.reshape(BT, chi2, chi, chi)
+
+            # r0 = Prod @ kron(conj(A0), A0) via two O(chi^5) matmuls:
+            # Step 1: temp[bt, aA, b, C] = sum_B Prod[bt, aA, b, B] * A0[bt, B, C]
+            temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))  # (BT, chi2, chi, chi)
+            # Step 2: r0[bt, aA, c, C] = sum_b conj(A0[bt, b, c])^* temp[bt, aA, b, C]
+            #       = conj(A0).mT[bt, c, b] @ temp[bt, aA, b, C]
+            r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp)  # (BT, chi2, chi, chi)
+            r0 = r0.reshape(BT, chi2, chi2)
+
+            # r1 = Prod @ kron(conj(A1), A1)
+            temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
+            r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp)
+            r1 = r1.reshape(BT, chi2, chi2)
+
+            # I: r0 + r1, Z: r0 - r1
+            mi = mask_i.view(1, Tc, 1, 1).expand(B, Tc, chi2, chi2).reshape(BT, chi2, chi2)
+            return torch.where(mi, r0 - r1, r0 + r1)
 
         totals = torch.zeros(B, dtype=ctype, device=device)
 
@@ -334,60 +349,31 @@ def expectation_value_batch_efficient_contraction(
             coefs = coeffs[t0:t1]     # (Tc,)
             Tc = mask.size(0)
 
-            # Initialize transfer product for each (b,t): (B,Tc,ll,rr)
-            # We’ll multiply Ei on the RIGHT: Prod = Ei0 @ Ei1 @ ... @ Ei_{N-1}
-            # Final value = trace(Prod) for ring closure.
-            # Start with site 0:
-            if cache_double_layers:
-                EI0, EZ0 = cached[0]
-            else:
-                EI0, EZ0 = site_double_layers_matrix(ring[:, 0].to(ctype))
-
-            m0 = mask[:, 0].view(1, Tc, 1, 1)  # broadcast
-            Prod = torch.where(
-                m0,
-                EZ0.unsqueeze(1).expand(-1, Tc, -1, -1),
-                EI0.unsqueeze(1).expand(-1, Tc, -1, -1),
-            ).contiguous()  # (B,Tc,ll,rr)
+            # Initialize with site 0 via Kronecker construction
+            A0_0, A1_0 = A0_all[:, 0], A1_all[:, 0]  # (B, chi, chi)
+            BT = B * Tc
+            # Start from identity: (B*Tc, chi2, chi2)
+            eye = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(BT, -1, -1)
+            Prod = _kron_right_batch(eye, A0_0, A1_0, mask[:, 0], Tc)
+            del eye
 
             # Sweep remaining sites
             for i in range(1, N):
-                if cache_double_layers:
-                    EIi, EZi = cached[i]
-                else:
-                    EIi, EZi = site_double_layers_matrix(ring[:, i].to(ctype))
+                Prod = _kron_right_batch(Prod, A0_all[:, i], A1_all[:, i], mask[:, i], Tc)
 
-                mi = mask[:, i].view(1, Tc, 1, 1)
-                Ei = torch.where(
-                    mi,
-                    EZi.unsqueeze(1).expand(-1, Tc, -1, -1),
-                    EIi.unsqueeze(1).expand(-1, Tc, -1, -1),
-                )  # (B,Tc,ll,rr)
-
-                # Prod(b,t,ll,rr) @ Ei(b,t,rr,rr_next) -> here rr_next == rr by construction
-                # Use batched matmul by fusing (B,Tc)
-                Prod = torch.matmul(
-                    Prod.reshape(B * Tc, ll, rr),
-                    Ei.reshape(B * Tc, rr, rr),
-                ).reshape(B, Tc, ll, rr).contiguous()
-
-            # Ring closure: trace over (ll,rr) diagonal of product matrix
-            # trace = einsum over diagonal; better: use .diagonal then sum
-            trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)  # (B,Tc)
+            # Ring closure: trace
+            Prod = Prod.reshape(B, Tc, chi2, chi2)
+            trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)  # (B, Tc)
 
             totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
 
-            # free working buffers of this term-chunk
-            del Prod, trace_vals, m0
-            if not cache_double_layers:
-                # if NOT caching, the per-site E_i matrices were freed each iteration automatically
-                pass
+            del Prod, trace_vals
             torch.cuda.empty_cache()
 
         out_parts.append(totals.real.float())  # (B,)
 
         # free per param-chunk tensors
-        del ring, totals, cached
+        del ring, totals
         torch.cuda.empty_cache()
 
     # concat across param chunks
@@ -645,27 +631,33 @@ def expectation_value_batch_correct_sampling(
         raise ValueError(f"Pauli mask width ({zmask.shape[1]}) != number of sites ({n})")
     T = int(coeffs.numel())
 
-    # ----- 3) Build right suffix R_suf[i] in χ²×χ², complex (B, χ², χ²); no R4 -----
+    # ----- 3) Build right suffix R_suf[i] using O(chi^5) Kronecker factoring -----
     chi2 = chi * chi
     env_dtype = torch.complex64 if use_fp32_env else cdtype
-    Id = torch.eye(chi2, dtype=env_dtype, device=device).expand(B, chi2, chi2).clone()
-
-    # helper to form E(A) = Σ_d A*(d) ⊗ A(d) = A0*⊗A0 + A1*⊗A1
-    def E_from_slices(A0i: Tensor, A1i: Tensor) -> Tensor:
-        # A0i/A1i: (B, chi, chi)
-        E0 = torch.einsum('bij,bkl->bikjl', A0i.conj(), A0i).reshape(B, chi2, chi2)
-        E1 = torch.einsum('bij,bkl->bikjl', A1i.conj(), A1i).reshape(B, chi2, chi2)
-        return (E0 + E1).to(env_dtype)
 
     R_suf = [None] * n
-    acc = Id
-    # Right-to-left pass; store R_suf for each i
+    acc = torch.eye(chi2, dtype=env_dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+
     for i in range(n - 1, -1, -1):
         R_suf[i] = acc
-        Ei = E_from_slices(A0[:, i], A1[:, i])   # (B, chi2, chi2)
-        acc = torch.bmm(Ei, acc)                 # (B, chi2, chi2)
-        del Ei
-    del acc, Id
+        A0i = A0[:, i].to(env_dtype)  # (B, chi, chi)
+        A1i = A1[:, i].to(env_dtype)
+
+        # Left-multiply: acc_new = E_i @ acc in O(chi^5) via Kronecker factoring
+        acc_4d = acc.reshape(B, chi, chi, chi2)  # (B, b, b', D)
+
+        # A0 contribution
+        temp = torch.matmul(A0i.unsqueeze(1), acc_4d)  # (B, chi, chi, chi2)
+        new_acc = torch.bmm(A0i.conj(), temp.reshape(B, chi, chi * chi2))  # (B, chi, chi*chi2)
+
+        # A1 contribution
+        temp = torch.matmul(A1i.unsqueeze(1), acc_4d)
+        new_acc = new_acc + torch.bmm(A1i.conj(), temp.reshape(B, chi, chi * chi2))
+
+        acc = new_acc.reshape(B, chi, chi, chi2).reshape(B, chi2, chi2).contiguous()
+        del new_acc, temp
+
+    del acc
     torch.cuda.empty_cache()
 
     # ----- 4) Sampler over shots (in chunks) -----
