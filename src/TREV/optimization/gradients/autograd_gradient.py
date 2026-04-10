@@ -116,8 +116,9 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128):
         (P,) float32 gradient tensor
     """
     # Must enable grad even if caller uses torch.no_grad() context
+    real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
     with torch.enable_grad():
-        theta_ad = theta.detach().to(torch.float64).clone().requires_grad_(True)
+        theta_ad = theta.detach().to(real_dtype).clone().requires_grad_(True)
         tensor = _build_tensor_diff(theta_ad, circuit, dtype)
         loss = _contraction_diff(tensor, hamiltonian, dtype)
         loss.backward()
@@ -136,7 +137,7 @@ class AutogradGradient(Gradient):
     """
 
     def __init__(self, measure_method: MeasureMethod = MeasureMethod.EFFICIENT_CONTRACTION,
-                 dtype=torch.complex128):
+                 dtype=torch.cfloat):
         super().__init__(measure_method)
         self.dtype = dtype
         self._verbose = True
