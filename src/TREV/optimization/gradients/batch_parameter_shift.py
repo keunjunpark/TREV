@@ -480,34 +480,91 @@ def expectation_value_batch_efficient_contraction(
             sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
             return r0 + sign * r1
 
+        # ── Identity-chain factored contraction ──
+        # Precompute all-I left prefix and right suffix for all B circuits.
+        # Then per Hamiltonian term, contract only at non-I (Z) sites.
+        # This reduces per-term work from O(N × chi^5) to O(k × chi^5)
+        # where k = number of Z-sites per term (~2 for MaxCut).
+
+        # Per-site A0, A1: (B, chi, chi)
+        site_A0 = [A0_all[:, i].contiguous() for i in range(N)]
+        site_A1 = [A1_all[:, i].contiguous() for i in range(N)]
+
+        # Batched Kronecker right-multiply for identity: Prod @ E_I
+        def _kron_I_batch(Prod_flat, A0_i, A1_i):
+            """Prod @ E_I for B circuits, no term batching."""
+            if _use_einsum:
+                P5 = Prod_flat.reshape(B, chi, chi, chi, chi)
+                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_i.conj(), P5, A0_i).reshape(B, chi2, chi2)
+                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_i.conj(), P5, A1_i).reshape(B, chi2, chi2)
+            else:
+                P4 = Prod_flat.reshape(B, chi2, chi, chi)
+                t = torch.matmul(P4, A0_i.unsqueeze(1))
+                r0 = torch.matmul(A0_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
+                t = torch.matmul(P4, A1_i.unsqueeze(1))
+                r1 = torch.matmul(A1_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
+            return r0 + r1
+
+        def _kron_Z_batch(Prod_flat, A0_i, A1_i):
+            """Prod @ E_Z for B circuits."""
+            if _use_einsum:
+                P5 = Prod_flat.reshape(B, chi, chi, chi, chi)
+                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_i.conj(), P5, A0_i).reshape(B, chi2, chi2)
+                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_i.conj(), P5, A1_i).reshape(B, chi2, chi2)
+            else:
+                P4 = Prod_flat.reshape(B, chi2, chi, chi)
+                t = torch.matmul(P4, A0_i.unsqueeze(1))
+                r0 = torch.matmul(A0_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
+                t = torch.matmul(P4, A1_i.unsqueeze(1))
+                r1 = torch.matmul(A1_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
+            return r0 - r1
+
+        # Precompute all-I left prefix: L_pre[i] = E_I(0) @ ... @ E_I(i-1)
+        eye_b = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+        L_pre = [None] * (N + 1)
+        acc = eye_b
+        for i in range(N):
+            L_pre[i] = acc
+            acc = _kron_I_batch(acc, site_A0[i], site_A1[i])
+        L_pre[N] = acc
+
+        # Precompute all-I right suffix (transposed for trace):
+        # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T
+        R_suf_T = [None] * (N + 1)
+        R_suf_T[N] = eye_b
+        acc = eye_b
+        for i in range(N - 1, -1, -1):
+            A0_mT = site_A0[i].mT.contiguous()
+            A1_mT = site_A1[i].mT.contiguous()
+            acc = _kron_I_batch(acc, A0_mT, A1_mT)
+            R_suf_T[i] = acc
+        del acc, eye_b
+
+        # Per-term contraction: only at Z-sites
         totals = torch.zeros(B, dtype=ctype, device=device)
 
-        for t0 in range(0, T, term_chunk):
-            t1 = min(t0 + term_chunk, T)
-            mask = paulis[t0:t1]      # (Tc, N)
-            coefs = coeffs[t0:t1]     # (Tc,)
-            Tc = mask.size(0)
+        for t in range(T):
+            z_sites = torch.where(paulis[t])[0].tolist()
 
-            # Initialize with site 0 via Kronecker construction
-            A0_0, A1_0 = A0_all[:, 0], A1_all[:, 0]  # (B, chi, chi)
-            BT = B * Tc
-            # Start from identity: (B*Tc, chi2, chi2)
-            eye = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(BT, -1, -1)
-            Prod = _kron_right_batch(eye, A0_0, A1_0, mask[:, 0], Tc)
-            del eye
+            if len(z_sites) == 0:
+                # All identity: trace of full ring
+                totals += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2))
+                continue
 
-            # Sweep remaining sites
-            for i in range(1, N):
-                Prod = _kron_right_batch(Prod, A0_all[:, i], A1_all[:, i], mask[:, i], Tc)
+            s_first = z_sites[0]
+            s_last = z_sites[-1]
 
-            # Ring closure: trace
-            Prod = Prod.reshape(B, Tc, chi2, chi2)
-            trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)  # (B, Tc)
+            run = L_pre[s_first].clone()
+            for i in range(s_first, s_last + 1):
+                if paulis[t, i]:
+                    run = _kron_Z_batch(run, site_A0[i], site_A1[i])
+                else:
+                    run = _kron_I_batch(run, site_A0[i], site_A1[i])
 
-            totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
+            # Trace: Tr(run @ R_suf) = (run * R_suf_T).sum()
+            totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2))
 
-            del Prod, trace_vals
-            torch.cuda.empty_cache()
+        del L_pre, R_suf_T
 
         out_parts.append(totals.real.float())  # (B,)
 
