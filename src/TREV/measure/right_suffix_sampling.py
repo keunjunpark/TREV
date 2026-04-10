@@ -19,34 +19,54 @@ def precompute_double_layer_and_right_suffix(cores):
       Es: [(E0,E1)] length n, each [chi^2,chi^2]
       R_suf: [n] where R_suf[i] = E_{i+1} ... E_{n-1} (identity if i==n-1)
       d2, device, dtype
+
+    Uses Kronecker-factored O(chi^5) contraction instead of O(chi^6) matmul.
     """
     device = cores[0].device
     dtype  = torch.complex128 if torch.is_complex(cores[0]) else torch.float64
 
-    E_list, Es = [], []
+    Es = []
+    A0_list, A1_list = [], []
     for c in cores:
         c = c.to(dtype)
         Ei, (Ei0, Ei1) = E_site(c)
-        E_list.append(Ei)
         Es.append((Ei0, Ei1))
+        A0_list.append(c[:, :, 0].contiguous())
+        A1_list.append(c[:, :, 1].contiguous())
 
-    n  = len(E_list)
-    d2 = E_list[0].shape[0]
-    I  = torch.eye(d2, dtype=E_list[0].dtype, device=device)
+    n   = len(cores)
+    chi = cores[0].shape[0]
+    d2  = chi * chi
+    chi2 = d2
 
-    # Build right suffixes with a left->right pass on the reversed list,
-    # but crucially LEFT-multiply to preserve forward order:
-    # Rpref_rev[j] = E_{n-1} ... E_{n-j}
-    Rpref_rev = [None] * (n + 1)
-    acc = I
-    Rpref_rev[0] = acc
-    E_rev = E_list[::-1]  # [E_{n-1}, E_{n-2}, ..., E_0]
-    for j in range(1, n + 1):
-        acc = E_rev[j - 1] @ acc        # <-- left-multiply (critical)
-        Rpref_rev[j] = acc
+    # Build right suffixes using O(chi^5) Kronecker-factored contraction.
+    # acc is stored as (chi^2, chi^2) but multiplied via 4D view to avoid O(chi^6).
+    # Left-multiply: acc_new = E_i @ acc
+    #   E_i[a,a',b,b'] = conj(A0[a,b])*A0[a',b'] + conj(A1[a,b])*A1[a',b']
+    #   result[a,a',d,d'] = sum_{b,b'} E_i[a,a',b,b'] * acc[b,b',d,d']
+    # Step 1: temp[b, a', d*d'] = A0 @ acc_4d[b]  — O(chi^4) total
+    # Step 2: result_flat[a, a'*d*d'] = conj(A0) @ temp_flat — O(chi^5)
 
-    # Map back: for site i, R_suf[i] = E_{i+1} ... E_{n-1} = Rpref_rev[n-(i+1)]
-    R_suf = [Rpref_rev[n - (i + 1)] for i in range(n)]
+    I_mat = torch.eye(d2, dtype=dtype, device=device)
+    acc = I_mat
+    R_suf = [None] * n
+
+    for i in range(n - 1, -1, -1):
+        R_suf[i] = acc
+        A0, A1 = A0_list[i], A1_list[i]
+
+        acc_4d = acc.reshape(chi, chi, chi2)          # (b, b', D) where D = d*d'
+
+        # A0 contribution: E_A0 @ acc
+        temp = torch.matmul(A0, acc_4d)               # (b, a', D) — broadcast over b
+        new_acc = torch.matmul(A0.conj(), temp.reshape(chi, chi * chi2))  # (a, a'D)
+
+        # A1 contribution: E_A1 @ acc
+        temp = torch.matmul(A1, acc_4d)               # (b, a', D)
+        new_acc = new_acc + torch.matmul(A1.conj(), temp.reshape(chi, chi * chi2))
+
+        acc = new_acc.reshape(chi2, chi2).contiguous()
+
     return Es, R_suf, d2, device, dtype
 
 
