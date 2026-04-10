@@ -44,7 +44,11 @@ def _apply_2q_diff(gate_matrix, qu0, qu1, dtype):
 
 
 def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
-    """Build tensor ring with autograd tracking (no in-place ops)."""
+    """Build tensor ring with autograd tracking (no in-place ops).
+
+    Uses native-dtype gate matrix computation to avoid precision loss
+    from info.py's forced .type(torch.cfloat) cast.
+    """
     N, chi = circuit.num_qubit, circuit.rank
     device = circuit.device
     cores = [torch.zeros(chi, chi, 2, dtype=dtype, device=device) for _ in range(N)]
@@ -68,36 +72,34 @@ def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
 
 
 def _contraction_diff(tensor, hamiltonian, dtype=torch.complex128):
-    """Differentiable expectation value contraction (vectorized over H terms)."""
+    """Differentiable expectation value contraction (per-term loop).
+
+    Uses a Python loop over Hamiltonian terms to avoid torch.where
+    which breaks autograd backward for complex tensors.
+    """
     N = tensor.shape[0]
     device = tensor.device
     Z = torch.tensor([[1, 0], [0, -1]], dtype=dtype, device=device)
     paulis = hamiltonian.get_bool_pauli_tensor().to(device)
-    T = len(hamiltonian.paulis)
-    coeffs = torch.tensor(
-        [c.item() if hasattr(c, 'item') else c for c in hamiltonian.coefficients],
-        dtype=dtype, device=device,
-    )
 
-    # Build per-site transfer matrices for all terms at once
-    # E_I and E_Z per site, then select via paulis mask
-    E_sites = []
-    for i in range(N):
-        curr = tensor[i].permute(0, 2, 1)  # (chi, 2, chi)
-        E_I = torch.tensordot(curr.conj(), curr, ([1], [1])).permute(0, 2, 1, 3)
-        AO_Z = torch.einsum('ldr,dk->lkr', curr, Z)
-        E_Z = torch.tensordot(curr.conj(), AO_Z, ([1], [1])).permute(0, 2, 1, 3)
-        # Select: (T, chi, chi, chi, chi)
-        mask = paulis[:, i].view(T, 1, 1, 1, 1)
-        E_sites.append(torch.where(mask, E_Z.unsqueeze(0).expand(T, -1, -1, -1, -1),
-                                         E_I.unsqueeze(0).expand(T, -1, -1, -1, -1)))
+    total = torch.zeros((), dtype=dtype, device=device)
+    for t in range(len(hamiltonian.paulis)):
+        coef = hamiltonian.coefficients[t]
+        ten = None
+        for i in range(N):
+            curr = tensor[i].permute(0, 2, 1)
+            if paulis[t, i]:
+                AO = torch.einsum('ldr,dk->lkr', curr, Z)
+            else:
+                AO = curr
+            E = torch.tensordot(curr.conj(), AO, ([1], [1])).permute(0, 2, 1, 3)
+            if ten is None:
+                ten = E
+            else:
+                ten = torch.tensordot(ten, E, dims=([2, 3], [0, 1]))
+        total = total + coef * torch.einsum('ikik->', ten)
 
-    # Contract ring: product of transfer matrices
-    prod = E_sites[0]
-    for i in range(1, N):
-        prod = torch.einsum('tijkl,tlkmn->tijmn', prod, E_sites[i])
-    vals = torch.einsum('tijij->t', prod)
-    return (coeffs * vals).sum().real
+    return total.real
 
 
 def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128):
