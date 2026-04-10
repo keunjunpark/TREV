@@ -280,17 +280,21 @@ def _dispatch_contraction(ring, circuit, hamiltonian, shots):
         eye = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(BT, -1, -1)
         Prod = eye
 
+        use_einsum = chi >= 8
         for i in range(N):
-            A0_i = A0_all[:, i]
-            A1_i = A1_all[:, i]
-            A0_exp = A0_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
-            A1_exp = A1_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+            A0_exp = A0_all[:, i].unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
+            A1_exp = A1_all[:, i].unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
 
-            Prod_4d = Prod.reshape(BT, chi2, chi, chi)
-            temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
-            r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
-            temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
-            r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
+            if use_einsum:
+                Prod_5d = Prod.reshape(BT, chi, chi, chi, chi)
+                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_exp.conj(), Prod_5d, A0_exp).reshape(BT, chi2, chi2)
+                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_exp.conj(), Prod_5d, A1_exp).reshape(BT, chi2, chi2)
+            else:
+                Prod_4d = Prod.reshape(BT, chi2, chi, chi)
+                temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
+                r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
+                temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
+                r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
 
             sign = torch.where(mask[:, i], -1.0, 1.0).to(ctype)
             sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
@@ -442,16 +446,16 @@ def expectation_value_batch_efficient_contraction(
         A0_all = ring[..., 0].to(ctype)  # (B, N, chi, chi)
         A1_all = ring[..., 1].to(ctype)  # (B, N, chi, chi)
 
+        # Use einsum for chi >= 8 (fused contraction faster), matmul for small chi
+        _use_einsum = chi >= 8
+
         def _kron_right_batch(Prod_flat, A0_i, A1_i, mask_i, Tc):
             """
             Kronecker-factored Prod @ E per term, O(chi^5) instead of O(chi^6).
 
-            Prod @ E where E = kron(conj(A0), A0) ± kron(conj(A1), A1)
-            E[bB, cC] = conj(A0[b,c]) * A0[B,C]  (I case, + for both)
-
             Prod_flat: (B*Tc, chi^2, chi^2)
-            A0_i, A1_i: (B, chi, chi) — site matrices (left_bond, right_bond)
-            mask_i: (Tc,) bool — True=Z, False=I for each term
+            A0_i, A1_i: (B, chi, chi)
+            mask_i: (Tc,) bool — True=Z, False=I
 
             Returns: (B*Tc, chi^2, chi^2)
             """
@@ -459,27 +463,20 @@ def expectation_value_batch_efficient_contraction(
             A0_exp = A0_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
             A1_exp = A1_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
 
-            # Prod: (BT, chi2, chi2) -> (BT, chi2, chi, chi) = (bt, aA, b, B)
-            # where aA = row index, (b, B) = col split into bra/ket right bonds
-            Prod_4d = Prod_flat.reshape(BT, chi2, chi, chi)
+            if _use_einsum:
+                # Fused 3-tensor einsum: fewer kernel launches, better for chi >= 8
+                Prod_5d = Prod_flat.reshape(BT, chi, chi, chi, chi)
+                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_exp.conj(), Prod_5d, A0_exp).reshape(BT, chi2, chi2)
+                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_exp.conj(), Prod_5d, A1_exp).reshape(BT, chi2, chi2)
+            else:
+                # 4 separate matmuls: lower overhead for small chi
+                Prod_4d = Prod_flat.reshape(BT, chi2, chi, chi)
+                temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
+                r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
+                temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
+                r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
 
-            # r0 = Prod @ kron(conj(A0), A0) via two O(chi^5) matmuls:
-            # Step 1: temp[bt, aA, b, C] = sum_B Prod[bt, aA, b, B] * A0[bt, B, C]
-            temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))  # (BT, chi2, chi, chi)
-            # Step 2: r0[bt, aA, c, C] = sum_b conj(A0[bt, b, c])^* temp[bt, aA, b, C]
-            #       = conj(A0).mT[bt, c, b] @ temp[bt, aA, b, C]
-            r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp)  # (BT, chi2, chi, chi)
-            r0 = r0.reshape(BT, chi2, chi2)
-
-            # r1 = Prod @ kron(conj(A1), A1)
-            temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
-            r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp)
-            r1 = r1.reshape(BT, chi2, chi2)
-
-            # I: r0 + r1, Z: r0 - r1. Use sign multiply instead of torch.where
-            # to avoid expanding bool mask to (BT, chi2, chi2).
-            # sign = +1.0 for I (mask=False), -1.0 for Z (mask=True)
-            sign = torch.where(mask_i, -1.0, 1.0).to(ctype)  # (Tc,)
+            sign = torch.where(mask_i, -1.0, 1.0).to(ctype)
             sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
             return r0 + sign * r1
 
