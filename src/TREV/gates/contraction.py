@@ -1,6 +1,18 @@
 from typing import Tuple
+import warnings
 import torch
 from torch import Tensor
+
+warnings.filterwarnings("ignore", message="torch.linalg.svd")
+
+def _truncated_svd(matrix: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Compute a rank-k SVD. Falls back to full SVD when truncation is unsafe."""
+    m, n = matrix.shape
+    k = min(rank, m, n)
+    #if k == min(m, n):
+    return torch.linalg.svd(matrix, full_matrices=False)
+    # u, s, v = torch.svd_lowrank(matrix, q=k, niter=2)
+    # return u, s, v.mH
 
 def _apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, qu_state_tensor_batch:Tensor):
     qu_state_tensor_batch = torch.einsum('bij,bklj->bikl', gate_matrix_batch, qu_state_tensor_batch)  # (B, 2, χ1, χ2)
@@ -45,22 +57,9 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
     # mps: 2 × χ1 × 2 × χ3 --> (2 * χ1) × (2 * χ3)
 
     u, s, v = torch.linalg.svd(mps)
-    # u: (2 * χ1) × (2 * χ1)
-    # s: 2 * min(χ1,χ3)
-    # y: (2 * χ3) × (2 * χ3)
-
-    # TODO apply rescaling to sx (below) b/c dim = min(χ1,χ3) ?= χ1
-    #  -- not technically necessary, unless chi values start off different
-    #  -- not necessary right now, but a future-proofing good-to-have
-
-    x = u[:, :chi_1]                                   # (2χ1, χ1)
-    sc = s[:chi_1].unsqueeze(0).to(mps.dtype)           # (1, χ1)
-    y = v[:chi_3, :]                                    # (χ3, 2χ3)
-
-    qu0 = (x * sc).reshape((2, chi_1, chi_1))
-    # qu0: ((2 * χ1) × [χ1]) . ([χ1] × χ1) = (2 * χ1) × χ1 --> 2 × χ1 × χ1
+    x, sx, y = u[:, :chi_1], torch.diag(s[:chi_1]).type(torch.cfloat), v[:chi_3, :]
+    qu0 = torch.mm(x, sx).reshape((2, chi_1, chi_1))
     qu1 = y.reshape((chi_3, 2, chi_3))
-    # qu1: χ3 × 2 × χ3
 
     qu0 = torch.moveaxis(qu0, 0, 2)
     # qu0: χ1 × χ1 × 2
@@ -72,7 +71,7 @@ def _apply_double_qubit_gate(gate_matrix: Tensor, qu_state_tensors: Tuple[Tensor
 
 def  _apply_double_qubit_gate_batch(
     gate_matrix: torch.Tensor,                              # (4, 4)   or (B, 4, 4)
-    qu_state_tensors: Tuple[torch.Tensor, torch.Tensor]     # qu0: (B, χ1, χ2, 2), qu1: (B, χ2, χ3, 2)
+    qu_state_tensors: Tuple[torch.Tensor, torch.Tensor],    # qu0: (B, χ1, χ2, 2), qu1: (B, χ2, χ3, 2)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Batched version of _apply_double_qubit_gate.
@@ -101,15 +100,11 @@ def  _apply_double_qubit_gate_batch(
 
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
-    u, s, vh = torch.linalg.svd(mps, full_matrices=False)   # u: (B, 2χ1, r),  vh: (B, r, 2χ3)
-
-    # Truncate to chi and absorb singular values via broadcast multiply
-    # (avoids diag_embed + bmm overhead)
-    x  = u[:, :, :chi1]                                     # (B, 2χ1, χ1)
-    sc = s[:, :chi1].unsqueeze(1).to(mps.dtype)              # (B, 1, χ1)
-    y  = vh[:, :chi3, :]                                     # (B, χ3, 2χ3)
-
-    qu0_new = (x * sc).reshape(B, 2, chi1, chi1).permute(0, 2, 3, 1)  # (B, χ1, χ1, 2)
-    qu1_new = y.reshape(B, chi3, 2, chi3).permute(0, 1, 3, 2)  # (B, χ3, χ3, 2)
+    u, s, vh = torch.linalg.svd(mps)
+    x  = u[:, :, :chi1]
+    sx = torch.diag_embed(s[:, :chi1]).to(torch.cfloat)
+    y  = vh[:, :chi3, :]
+    qu0_new = torch.bmm(x, sx).reshape(B, 2, chi1, chi1).permute(0, 2, 3, 1)
+    qu1_new = y.reshape(B, chi3, 2, chi3).permute(0, 1, 3, 2)
 
     return qu0_new, qu1_new
