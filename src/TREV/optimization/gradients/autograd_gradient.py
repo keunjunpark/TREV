@@ -102,6 +102,68 @@ def _contraction_diff(tensor, hamiltonian, dtype=torch.complex128):
     return total.real
 
 
+def _contraction_real(tensor, hamiltonian):
+    """Differentiable contraction in REAL arithmetic (compilable).
+
+    Takes a complex tensor, converts to real ONCE, then all operations
+    are real → torch.compile can fuse them.
+
+    tensor: (N, chi, chi, 2) complex
+    Returns: real scalar
+    """
+    N = tensor.shape[0]
+    device = tensor.device
+    chi = tensor.shape[1]
+
+    # Convert to real ONCE: (N, 2, chi, chi, 2_phys) where dim 1 = [real, imag]
+    t_r = tensor.real  # (N, chi, chi, 2)
+    t_i = tensor.imag  # (N, chi, chi, 2)
+
+    Z_r = torch.tensor([[1., 0.], [0., -1.]], device=device)
+    paulis = hamiltonian.get_bool_pauli_tensor().to(device)
+
+    total = torch.zeros((), device=device)
+    for t_idx in range(len(hamiltonian.paulis)):
+        coef = hamiltonian.coefficients[t_idx]
+        ten_r = None
+        ten_i = None
+        for i in range(N):
+            # curr: (chi, 2_phys, chi) — permute from (chi, chi, 2)
+            cr = t_r[i].permute(0, 2, 1)  # (chi, 2, chi) real part
+            ci = t_i[i].permute(0, 2, 1)  # (chi, 2, chi) imag part
+
+            if paulis[t_idx, i]:
+                # AO = curr @ Z on physical dim: Z is real, so AO_r = cr@Z, AO_i = ci@Z
+                AOr = torch.einsum('ldr,dk->lkr', cr, Z_r)
+                AOi = torch.einsum('ldr,dk->lkr', ci, Z_r)
+            else:
+                AOr, AOi = cr, ci
+
+            # E = conj(curr) tensordot AO on dim 1
+            # conj(curr) = (cr, -ci)
+            # E_r = cr·AOr + ci·AOi,  E_i = cr·AOi - ci·AOr
+            Er = (torch.tensordot(cr, AOr, ([1], [1])) +
+                  torch.tensordot(ci, AOi, ([1], [1]))).permute(0, 2, 1, 3)
+            Ei = (torch.tensordot(cr, AOi, ([1], [1])) -
+                  torch.tensordot(ci, AOr, ([1], [1]))).permute(0, 2, 1, 3)
+
+            if ten_r is None:
+                ten_r, ten_i = Er, Ei
+            else:
+                # Complex tensordot: ten @ E on dims ([2,3],[0,1])
+                new_r = (torch.tensordot(ten_r, Er, ([2, 3], [0, 1])) -
+                         torch.tensordot(ten_i, Ei, ([2, 3], [0, 1])))
+                new_i = (torch.tensordot(ten_r, Ei, ([2, 3], [0, 1])) +
+                         torch.tensordot(ten_i, Er, ([2, 3], [0, 1])))
+                ten_r, ten_i = new_r, new_i
+
+        # Trace: Re(sum_{i,j} ten[i,j,i,j])
+        trace_r = torch.einsum('ijij->', ten_r)
+        total = total + coef * trace_r
+
+    return total
+
+
 def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128):
     """
     Compute gradient via backpropagation through differentiable SVD.
