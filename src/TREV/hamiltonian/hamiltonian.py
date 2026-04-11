@@ -53,6 +53,30 @@ class Hamiltonian():
             result = torch.kron(result, OPS[p])
         return result
 
+    def get_qwc_groups(self):
+        """Group Hamiltonian terms by qubit-wise commuting measurement bases."""
+        groups = []
+        for t, pauli in enumerate(self.paulis):
+            placed = False
+            for g_indices, g_basis in groups:
+                compatible = True
+                for q in range(self.num_qubits):
+                    if pauli[q] == 'I' or g_basis[q] == 'I':
+                        continue
+                    if pauli[q] != g_basis[q]:
+                        compatible = False
+                        break
+                if compatible:
+                    g_indices.append(t)
+                    for q in range(self.num_qubits):
+                        if g_basis[q] == 'I' and pauli[q] != 'I':
+                            g_basis[q] = pauli[q]
+                    placed = True
+                    break
+            if not placed:
+                groups.append(([t], list(pauli)))
+        return [{'term_indices': idx, 'basis': ''.join(b)} for idx, b in groups]
+
     def get_density_matrix(self):
 
         dim = 2 ** self.num_qubits
@@ -62,4 +86,31 @@ class Hamiltonian():
             rho += coeff * self.pauli_string_to_matrix_torch(pauli_str)
 
         return rho
+
+
+_S = 2 ** -0.5
+
+_MEAS_ROTATIONS = {
+    'X': torch.tensor([[_S, _S], [_S, -_S]], dtype=torch.cfloat),
+    'Y': torch.tensor([[_S, -1j * _S], [-1j * _S, _S]], dtype=torch.cfloat),
+}
+
+
+def rotate_tensor_for_measurement(tensor, basis):
+    """Apply measurement basis rotations to tensor ring cores.
+
+    For X sites: Hadamard. For Y sites: Rx(pi/2). I/Z: no rotation.
+    """
+    rotated = tensor.clone()
+    is_batched = tensor.dim() == 5
+    for i, b in enumerate(basis):
+        U = _MEAS_ROTATIONS.get(b)
+        if U is None:
+            continue
+        U = U.to(device=tensor.device, dtype=tensor.dtype)
+        if is_batched:
+            rotated[:, i] = rotated[:, i] @ U.mT
+        else:
+            rotated[i] = rotated[i] @ U.mT
+    return rotated
 

@@ -1,21 +1,28 @@
 import time
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-# # .../measure/efficient_contraction.py
-# from __future__ import annotations
-from typing import Optional
-
+import torch.multiprocessing as mp
 
 import torch
 from torch import Tensor, no_grad
 
-from TREV.measure.contraction import precompute_double_layer_and_right_suffix
 from TREV.optimization.gradients.set_batch_size import auto_batch_size
 
 from ...circuit import Circuit
-from ...hamiltonian.hamiltonian import Hamiltonian
+from ...hamiltonian.hamiltonian import Hamiltonian, rotate_tensor_for_measurement
 from ...measure.enums import MeasureMethod
 from ...optimization.gradients.gradient import Gradient
+from TREV.measure.contraction import precompute_double_layer_and_right_suffix
+
+def _validate_zi_only(hamiltonian, method_name: str):
+    """Raise if Hamiltonian contains X or Y terms (sampling can't evaluate them)."""
+    if not hamiltonian.has_only_zi:
+        raise ValueError(
+            f"{method_name} only supports Z/I Hamiltonians. "
+            "Use EFFICIENT_CONTRACTION for Hamiltonians with X/Y terms."
+        )
+
 
 def _gpu_info(device: torch.device) -> str:
     if device.type != "cuda":
@@ -28,8 +35,225 @@ def _gpu_info(device: torch.device) -> str:
     except Exception:
         return name
 
+
+def _dispatch_expectation(param_batch, circuit, hamiltonian, shots, measure_method):
+    """Route to the correct batched expectation value backend."""
+    if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
+        return expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, shots)
+    elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
+        return expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, shots)
+    elif measure_method == MeasureMethod.PERFECT_SAMPLING:
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
+    else:
+        return expectation_value_batch(param_batch, circuit, hamiltonian, shots)
+
+
+def _get_gpu_count() -> int:
+    """Return the number of available CUDA GPUs, or 0 if CUDA is unavailable."""
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
+def _distribute_params_evenly(P, num_gpus, chunk_size):
+    """Divide P parameters evenly across num_gpus, each split into chunks.
+
+    Returns dict mapping gpu_id -> list of (start, stop) tuples.
+    """
+    base_per_gpu = P // num_gpus
+    remainder = P % num_gpus
+    gpu_ranges = {}
+    offset = 0
+    for gpu_id in range(num_gpus):
+        count = base_per_gpu + (1 if gpu_id < remainder else 0)
+        if count == 0:
+            gpu_ranges[gpu_id] = []
+            continue
+        gpu_end = offset + count
+        ranges = []
+        for s in range(offset, gpu_end, chunk_size):
+            ranges.append((s, min(s + chunk_size, gpu_end)))
+        gpu_ranges[gpu_id] = ranges
+        offset = gpu_end
+    return gpu_ranges
+
+
+def _mp_worker_fn(gpu_id, ranges, base_cpu, circuit_cpu, hamiltonian, shift, shots,
+                  measure_method, chunk_size, grad_shared):
+    """Multiprocessing worker: compute gradient slices on assigned GPU."""
+    import traceback
+    device = f'cuda:{gpu_id}'
+    circuit_clone = circuit_cpu.to_device(device)
+    base_dev = base_cpu.to(device)
+
+    try:
+        for start, stop in ranges:
+            C = stop - start
+            idx = torch.arange(start, stop, device=device)
+            arange_C = torch.arange(C, device=device)
+
+            batch = base_dev.expand(2 * C, -1).clone()
+            batch[arange_C, idx] += shift
+            batch[C + arange_C, idx] -= shift
+
+            exp_vals = _dispatch_expectation(batch, circuit_clone, hamiltonian, shots, measure_method)
+            grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+            grad_shared[start:stop] = grad_slice.cpu()
+    except Exception as e:
+        print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+        traceback.print_exc()
+    finally:
+        del circuit_clone, base_dev
+        torch.cuda.empty_cache()
+
+
+def _persistent_worker_fn(gpu_id, circuit_cpu, hamiltonian, shift, shots,
+                          measure_method, chunk_size,
+                          base_shared, grad_shared, ranges_queue, done_barrier,
+                          shutdown_event):
+    """Persistent process worker — stays alive across iterations.
+
+    Waits for work on ranges_queue, computes, writes to grad_shared,
+    then syncs at done_barrier. Loops until shutdown_event is set.
+    """
+    import traceback
+    device = f'cuda:{gpu_id}'
+    circuit_clone = circuit_cpu.to_device(device)
+
+    try:
+        while not shutdown_event.is_set():
+            # Wait for work (ranges list) or shutdown sentinel
+            try:
+                msg = ranges_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            if msg is None:  # shutdown sentinel
+                break
+
+            ranges = msg
+            try:
+                P = base_shared.shape[0]
+                base_dev = base_shared.to(device).unsqueeze(0)  # (1, P)
+
+                for start, stop in ranges:
+                    C = stop - start
+                    idx = torch.arange(start, stop, device=device)
+                    arange_C = torch.arange(C, device=device)
+
+                    batch = base_dev.expand(2 * C, -1).clone()
+                    batch[arange_C, idx] += shift
+                    batch[C + arange_C, idx] -= shift
+
+                    exp_vals = _dispatch_expectation(
+                        batch, circuit_clone, hamiltonian, shots, measure_method)
+                    grad_slice = 0.5 * (exp_vals[:C] - exp_vals[C:])
+                    grad_shared[start:stop] = grad_slice.cpu()
+            except Exception as e:
+                print(f"[TREV] GPU {gpu_id} worker FAILED: {e}", flush=True)
+                traceback.print_exc()
+
+            # Release cached GPU memory before going idle
+            torch.cuda.empty_cache()
+
+            # Signal this worker is done for this iteration
+            done_barrier.wait()
+    finally:
+        # Cleanup GPU memory on exit
+        del circuit_clone
+        torch.cuda.empty_cache()
+
+
+class _MultiGPUPool:
+    """Persistent pool of worker processes for multi-GPU gradient computation."""
+
+    _active_pool = None  # class-level singleton — only one pool at a time
+
+    def __init__(self, num_gpus, circuit, hamiltonian, shift, shots,
+                 measure_method, chunk_size, P):
+        # Kill any previous pool first (e.g. from a different gradient object)
+        if _MultiGPUPool._active_pool is not None:
+            print("[TREV] Shutting down previous multi-GPU pool", flush=True)
+            _MultiGPUPool._active_pool.shutdown()
+        _MultiGPUPool._active_pool = self
+
+        ctx = mp.get_context('spawn')
+
+        circuit_cpu = circuit.to_device('cpu')
+        self.num_gpus = num_gpus
+        self.P = P
+
+        # Shared-memory tensors for data exchange (no Queue serialization)
+        self.base_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+        self.grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+
+        # Per-worker queue for sending ranges
+        self.ranges_queues = [ctx.Queue() for _ in range(num_gpus)]
+        # Barrier: num_gpus workers + 1 main thread
+        self.done_barrier = ctx.Barrier(num_gpus + 1)
+        self.shutdown_event = ctx.Event()
+
+        self.processes = []
+        for gpu_id in range(num_gpus):
+            p = ctx.Process(
+                target=_persistent_worker_fn,
+                args=(gpu_id, circuit_cpu, hamiltonian, shift, shots,
+                      measure_method, chunk_size,
+                      self.base_shared, self.grad_shared,
+                      self.ranges_queues[gpu_id], self.done_barrier,
+                      self.shutdown_event),
+            )
+            p.daemon = True
+            p.start()
+            self.processes.append(p)
+        print(f"[TREV] Persistent multi-GPU pool started: {num_gpus} workers", flush=True)
+
+    def compute_gradient(self, params, chunk_size, device):
+        P = params.numel()
+
+        # Update shared base tensor
+        self.base_shared[:P] = params.detach().cpu()
+
+        # Free main-process GPU cache so GPU 0 worker has room
+        torch.cuda.empty_cache()
+
+        # Distribute parameters evenly across GPUs
+        gpu_ranges = _distribute_params_evenly(P, self.num_gpus, chunk_size)
+
+        # Send work to each worker
+        for gpu_id in range(self.num_gpus):
+            self.ranges_queues[gpu_id].put(gpu_ranges[gpu_id])
+
+        # Wait for all workers to finish
+        self.done_barrier.wait()
+
+        # Copy result to device
+        return self.grad_shared[:P].to(device).clone()
+
+    def shutdown(self):
+        if _MultiGPUPool._active_pool is self:
+            _MultiGPUPool._active_pool = None
+        self.shutdown_event.set()
+        for q in self.ranges_queues:
+            try:
+                q.put(None)  # sentinel
+            except Exception:
+                pass
+        for p in self.processes:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        self.processes.clear()
+        # Release any remaining GPU cache in the main process
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __del__(self):
+        self.shutdown()
+
+
 class BatchParameterShiftGradient(Gradient):
-    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False):
+    def __init__(self, shift, batch_size, shots, measure_method: MeasureMethod, depth:int, is_partial:bool=False, num_gpus: int | None = None):
         super().__init__(measure_method)
         self.shift = shift
         self.batch_size = batch_size  # may be None
@@ -38,6 +262,14 @@ class BatchParameterShiftGradient(Gradient):
         self.curr_depth = 0
         self.is_partial = is_partial
         self._autotuned = False
+
+        # Multi-GPU: auto-detect if None
+        if num_gpus is None:
+            self._num_gpus = _get_gpu_count()
+        else:
+            self._num_gpus = num_gpus
+
+        self._gpu_pool = None  # lazy-initialized persistent pool
 
         # optional: control printing via env var
         self._verbose = True
@@ -53,18 +285,12 @@ class BatchParameterShiftGradient(Gradient):
                 C = idx.numel()
                 if C == 0:
                     return
-                plus = base.repeat(C, 1)
-                minus = plus.clone()
-                plus[torch.arange(C), idx] += self.shift
-                minus[torch.arange(C), idx] -= self.shift
-                param_batch = torch.cat([plus, minus], dim=0)
-
-                if self.measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-                    _ = expectation_value_batch_efficient_contraction(param_batch, circuit, hamiltonian, self.shots)
-                elif self.measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-                    _ = expectation_value_batch_right_suffix(param_batch, circuit, hamiltonian, self.shots)
-                else:
-                    _ = expectation_value_batch(param_batch, circuit, hamiltonian, self.shots)
+                arange_C = torch.arange(C, device=device)
+                # Build a (2C, P) batch without repeat/cat
+                param_batch = base.expand(2 * C, -1).clone()
+                param_batch[arange_C, idx] += self.shift
+                param_batch[C + arange_C, idx] -= self.shift
+                _dispatch_expectation(param_batch, circuit, hamiltonian, self.shots, self.measure_method)
 
             self.batch_size = auto_batch_size(
                 run_batch_fn,
@@ -79,18 +305,36 @@ class BatchParameterShiftGradient(Gradient):
             self._autotuned = True
 
             if self._verbose:
-                print(
-                    f"[TREV] Auto batch_size selected: {self.batch_size} "
-                    f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
-                    f"\n"
-                    , flush=True
-                )
+                gpu_msg = f"[TREV] Auto batch_size selected: {self.batch_size} " \
+                          f"(measure={self.measure_method.name}, total_theta={P}, device={_gpu_info(device)})"
+                if self._num_gpus > 1:
+                    gpu_msg += f"\n[TREV] Multi-GPU enabled: {self._num_gpus} GPUs"
+                print(gpu_msg + "\n", flush=True)
 
-        val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
-                             self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method)
+        # Use persistent pool for multi-GPU (avoids spawn overhead each iteration)
+        if self._num_gpus > 1 and not self.is_partial:
+            if self._gpu_pool is None:
+                # Free main-process GPU cache so workers have room (especially GPU 0)
+                torch.cuda.empty_cache()
+                self._gpu_pool = _MultiGPUPool(
+                    self._num_gpus, circuit, hamiltonian,
+                    self.shift, self.shots, self.measure_method,
+                    self.batch_size, theta.numel(),
+                )
+            device = circuit.device
+            val = self._gpu_pool.compute_gradient(theta, self.batch_size, device)
+        else:
+            val = batch_gradient(theta, circuit, hamiltonian, self.batch_size, self.shots,
+                                 self.shift, self.depth, self.curr_depth, self.is_partial, self.measure_method,
+                                 num_gpus=1)
         self.curr_depth = (self.curr_depth + 1) % self.depth
         return val
-    
+
+    def __del__(self):
+        if self._gpu_pool is not None:
+            self._gpu_pool.shutdown()
+            self._gpu_pool = None
+
 
 def batch_gradient(
         params:     torch.Tensor,           # (P,)
@@ -102,210 +346,102 @@ def batch_gradient(
         depth:int,
         curr_depth:int,
         is_partial:bool,
-        measure_method: MeasureMethod
+        measure_method: MeasureMethod,
+        num_gpus: int | None = None,
 ) -> torch.Tensor:
     """
-    Memory‑frugal parameter‑shift gradient.
+    Memory-frugal parameter-shift gradient.
 
-    params   : (P,)  – single circuit’s parameters
-    chunk_size  : how many θ‑indices to shift at once
-    *circuit_*  : whatever run_circuit_batched needs
-    returns     : (P,)  – gradient d⟨O⟩/dθ
+    params   : (P,)  -- single circuit's parameters
+    chunk_size  : how many theta-indices to shift at once
+    num_gpus : number of GPUs to use (None or <=1 for single-GPU)
+    returns     : (P,)  -- gradient d<O>/d_theta
     """
     with torch.no_grad():
         device = circuit.device
         P      = params.numel()
         grad   = torch.empty(P, device=device, dtype=torch.float32)
-        base   = params.unsqueeze(0)            # (1, P)  acts as “B = 1”
+        base   = params.detach().to(device).unsqueeze(0)  # (1, P)
 
         if is_partial:
-            dP = int(P/depth)
-            start = dP*curr_depth
+            dP = P // depth
+            start = dP * curr_depth
             stop = min(start + dP, P)
+            C = stop - start
 
             idx = torch.arange(start, stop, device=device)
+            arange_C = torch.arange(C, device=device)
 
-            eye = torch.eye(len(idx), device=device) * shift  # (C,C)
-            plus = base.repeat(len(idx), 1).to(device)  # (C,P)
-            minus = plus.clone().to(device)
+            batch = base.expand(2 * C, -1).clone()  # (2C, P)
+            batch[arange_C, idx] += shift
+            batch[C + arange_C, idx] -= shift
 
-            plus[torch.arange(len(idx)), idx] += shift
-            minus[torch.arange(len(idx)), idx] -= shift
-            batch = torch.cat([plus, minus], dim=0).to(device)  # (2C,P)
-            if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-                exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-            elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-                exp_vals = expectation_value_batch_right_suffix(batch, circuit, hamiltonian, shots)
-            else:
-                exp_vals = expectation_value_batch(batch, circuit, hamiltonian, shots)
-            fwd, bwd = exp_vals[:len(idx)], exp_vals[len(idx):]
+            exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
+            grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
+        elif num_gpus is not None and num_gpus > 1 and P > 0:
+            # --- Multi-GPU path (multiprocessing to avoid GIL) ---
+            # Distribute parameters evenly across GPUs
+            gpu_ranges = _distribute_params_evenly(P, num_gpus, chunk_size)
 
-            grad[start:stop] = 0.5 * (fwd - bwd)
+            # CPU copies for safe cross-process sharing
+            circuit_cpu = circuit.to_device('cpu')
+            base_cpu = base.cpu()
+
+            # Shared-memory tensor: workers write directly, no Queue needed
+            grad_shared = torch.zeros(P, dtype=torch.float32).share_memory_()
+
+            total_chunks = sum(len(v) for v in gpu_ranges.values())
+            print(f"[TREV] Spawning {num_gpus} workers, P={P}, chunk_size={chunk_size}, "
+                  f"total_chunks={total_chunks}", flush=True)
+            for gpu_id in range(num_gpus):
+                n_ch = len(gpu_ranges[gpu_id])
+                n_p = sum(s[1]-s[0] for s in gpu_ranges[gpu_id])
+                print(f"[TREV]   GPU {gpu_id}: {n_ch} chunks, {n_p} params", flush=True)
+
+            # Launch worker processes (spawn context for CUDA safety)
+            ctx = mp.get_context('spawn')
+            processes = []
+            for gpu_id in range(num_gpus):
+                if not gpu_ranges[gpu_id]:
+                    continue
+                p = ctx.Process(
+                    target=_mp_worker_fn,
+                    args=(gpu_id, gpu_ranges[gpu_id], base_cpu, circuit_cpu,
+                          hamiltonian, shift, shots, measure_method,
+                          chunk_size, grad_shared),
+                )
+                p.start()
+                print(f"[TREV] GPU {gpu_id} process started (PID {p.pid})", flush=True)
+                processes.append(p)
+
+            # Wait for all workers to finish
+            for p in processes:
+                p.join()
+
+            # Check for crashed workers
+            for p in processes:
+                if p.exitcode != 0:
+                    print(f"[TREV] WARNING: Worker PID {p.pid} exited with code {p.exitcode}", flush=True)
+
+            # Copy shared result to device
+            grad[:] = grad_shared.to(device)
+            # Release main process GPU cache
+            torch.cuda.empty_cache()
+            print(f"[TREV] All workers done, grad copied to {device}", flush=True)
         else:
             for start in range(0, P, chunk_size):
                 stop   = min(start + chunk_size, P)
+                C      = stop - start
                 idx    = torch.arange(start, stop, device=device)
-                plus   = base.repeat(len(idx), 1).to(device)                     # (C,P)
-                minus  = plus.clone().to(device)
+                arange_C = torch.arange(C, device=device)
 
-                plus [torch.arange(len(idx)), idx] += shift
-                minus[torch.arange(len(idx)), idx] -= shift
-                batch  = torch.cat([plus, minus], dim=0).to(device)                 # (2C,P)
+                batch = base.expand(2 * C, -1).clone()  # (2C, P)
+                batch[arange_C, idx] += shift
+                batch[C + arange_C, idx] -= shift
 
-                if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-                    exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-                elif measure_method == MeasureMethod.RIGHT_SUFFIX_SAMPLING:
-                    
-                    exp_vals = expectation_value_batch_right_suffix(batch, circuit, hamiltonian, shots)
-                else:
-                    exp_vals = expectation_value_batch(batch, circuit, hamiltonian, shots)
-                fwd, bwd = exp_vals[:len(idx)], exp_vals[len(idx):]
-
-                grad[start:stop] = 0.5 * (fwd - bwd)
+                exp_vals = _dispatch_expectation(batch, circuit, hamiltonian, shots, measure_method)
+                grad[start:stop] = 0.5 * (exp_vals[:C] - exp_vals[C:])
         return grad
-
-
-def batch_gradient_cached(
-        params:     torch.Tensor,           # (P,)
-        circuit,
-        hamiltonian,
-        chunk_size: int,
-        shots: int,
-        shift: float,
-        measure_method: MeasureMethod,
-) -> torch.Tensor:
-    """
-    Parameter-shift gradient with prefix caching.
-
-    Caches the tensor state before each parameter segment (separated by 2q gates).
-    Only replays gates from the segment onward for each shifted parameter.
-    """
-    with torch.no_grad():
-        device = circuit.device
-        P = params.numel()
-        grad = torch.empty(P, device=device, dtype=torch.float32)
-
-        checkpoints = circuit.get_prefix_checkpoints()
-
-        # Only use caching for segments with enough params to justify prefix cost.
-        # Merge small segments into uncached runs.
-        MIN_SEG_SIZE = 4
-        cacheable = [(g, lo, hi) for g, (lo, hi) in checkpoints if (hi - lo) >= MIN_SEG_SIZE]
-
-        if not cacheable:
-            return batch_gradient(params, circuit, hamiltonian, chunk_size, shots,
-                                  shift, 1, 0, False, measure_method)
-
-        # Handle uncached params (small segments) with standard path
-        cached_params = set()
-        for _, lo, hi in cacheable:
-            cached_params.update(range(lo, hi))
-        uncached = sorted(set(range(P)) - cached_params)
-
-        if uncached:
-            for start in range(0, len(uncached), chunk_size):
-                stop = min(start + chunk_size, len(uncached))
-                idx = torch.tensor(uncached[start:stop], device=device)
-                C = len(idx)
-                base_rep = params.unsqueeze(0).repeat(C, 1)
-                plus = base_rep.clone()
-                minus = base_rep.clone()
-                plus[torch.arange(C), idx] += shift
-                minus[torch.arange(C), idx] -= shift
-                batch = torch.cat([plus, minus], dim=0)
-                if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-                    exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-                else:
-                    exp_vals = expectation_value_batch_efficient_contraction(batch, circuit, hamiltonian, shots)
-                fwd, bwd = exp_vals[:C], exp_vals[C:]
-                grad[idx] = 0.5 * (fwd - bwd)
-
-        for seg_gate_start, param_lo, param_hi in cacheable:
-            # Build prefix once for this segment (identical for all shifts)
-            prefix = circuit.build_prefix_batch(params, 1, seg_gate_start)
-
-            # Process params in this segment in chunks
-            for start in range(param_lo, param_hi, chunk_size):
-                stop = min(start + chunk_size, param_hi)
-                idx = torch.arange(start, stop, device=device)
-                C = len(idx)
-
-                base = params.unsqueeze(0)
-                plus = base.repeat(C, 1)
-                minus = plus.clone()
-                plus[torch.arange(C), idx] += shift
-                minus[torch.arange(C), idx] -= shift
-                batch = torch.cat([plus, minus], dim=0)  # (2C, P)
-                B = batch.shape[0]
-
-                # Build from cached prefix
-                prefix_exp = prefix.expand(B, -1, -1, -1, -1)
-                ring = circuit.build_from_prefix_batch(prefix_exp, batch, B, seg_gate_start)
-
-                # Contraction
-                if measure_method == MeasureMethod.EFFICIENT_CONTRACTION:
-                    exp_vals = _dispatch_contraction(ring, circuit, hamiltonian, shots)
-                else:
-                    exp_vals = _dispatch_contraction(ring, circuit, hamiltonian, shots)
-
-                fwd, bwd = exp_vals[:C], exp_vals[C:]
-                grad[start:stop] = 0.5 * (fwd - bwd)
-
-        return grad
-
-
-def _dispatch_contraction(ring, circuit, hamiltonian, shots):
-    """Run efficient contraction directly on pre-built ring tensor."""
-    B, N, chi, _, _ = ring.shape
-    ctype = torch.cfloat
-    device = ring.device
-
-    paulis = hamiltonian.get_bool_pauli_tensor().to(device)
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=ctype, device=device)
-    T, _ = paulis.shape
-
-    chi2 = chi * chi
-    A0_all = ring[..., 0].to(ctype)
-    A1_all = ring[..., 1].to(ctype)
-
-    totals = torch.zeros(B, dtype=ctype, device=device)
-
-    for t0 in range(0, T, T):  # single chunk
-        t1 = T
-        mask = paulis[t0:t1]
-        coefs = coeffs[t0:t1]
-        Tc = mask.size(0)
-        BT = B * Tc
-
-        eye = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(BT, -1, -1)
-        Prod = eye
-
-        use_einsum = chi >= 8
-        for i in range(N):
-            A0_exp = A0_all[:, i].unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
-            A1_exp = A1_all[:, i].unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
-
-            if use_einsum:
-                Prod_5d = Prod.reshape(BT, chi, chi, chi, chi)
-                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_exp.conj(), Prod_5d, A0_exp).reshape(BT, chi2, chi2)
-                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_exp.conj(), Prod_5d, A1_exp).reshape(BT, chi2, chi2)
-            else:
-                Prod_4d = Prod.reshape(BT, chi2, chi, chi)
-                temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
-                r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
-                temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
-                r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
-
-            sign = torch.where(mask[:, i], -1.0, 1.0).to(ctype)
-            sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
-            Prod = r0 + sign * r1
-
-        Prod = Prod.reshape(B, Tc, chi2, chi2)
-        trace_vals = Prod.diagonal(offset=0, dim1=2, dim2=3).sum(dim=-1)
-        totals += (trace_vals * coefs.view(1, Tc)).sum(dim=1)
-
-    return totals.real.float()
-
 
 def expectation_value_batch(
     param_batch: torch.Tensor,
@@ -321,74 +457,155 @@ def expectation_value_batch(
     """
     with torch.no_grad():
         if seed is not None:
-            # Ensure deterministic sampling across devices
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
         B = param_batch.shape[0]
-        if circuit.device == 'cuda':
+        device = circuit.device
+        if device == 'cuda':
             torch.cuda.synchronize()
-
-        batch_coefs = (
-            torch.tensor(hamiltonian.coefficients, dtype=torch.complex64, device=circuit.device)
-            .unsqueeze(0).unsqueeze(0).expand(B, shots, -1).clone()
-        )
 
         ring_tensor_batch = circuit.build_tensor_batch(param_batch, B)
         B, N = ring_tensor_batch.shape[:2]
-        paulis_tensor = hamiltonian.get_bool_pauli_tensor_old().to(device=circuit.device)
 
-        q0 = torch.tensor([[1], [0]], dtype=torch.cfloat, device=circuit.device)
-        q1 = torch.tensor([[0], [1]], dtype=torch.cfloat, device=circuit.device)
+        groups = hamiltonian.get_qwc_groups()
+        op_tensor = hamiltonian.get_pauli_op_tensor().to(device=device)
+        all_coeffs = hamiltonian.coefficients
+        shots_per_group = max(1, shots // len(groups))
 
-        assert all(len(p) >= N for p in paulis_tensor), \
-            f"Each Pauli string must have at least {N} qubits!"
+        q0 = torch.tensor([[1], [0]], dtype=torch.cfloat, device=device)
+        q1 = torch.tensor([[0], [1]], dtype=torch.cfloat, device=device)
 
-        batch_prev: torch.Tensor | None = None
+        grand_totals = torch.zeros(B, dtype=torch.float64, device=device)
 
-        for i in range(N):
-            curr_tens = ring_tensor_batch[:, i].contiguous()
-
-            if i == 0:
-                qubit_0 = torch.einsum('bijk,kl->bijl', curr_tens, q0).squeeze(-1)
-                qubit_1 = torch.einsum('bijk,kl->bijl', curr_tens, q1).squeeze(-1)
-                batch_qubit_0 = qubit_0.unsqueeze(1).expand(-1, shots, -1, -1).contiguous()
-                batch_qubit_1 = qubit_1.unsqueeze(1).expand(-1, shots, -1, -1).contiguous()
-            else:
-                contracted = torch.einsum('bsij,bjkl->bsikl', batch_prev, curr_tens)
-                batch_qubit_0 = torch.einsum('bsijk,kl->bsijl', contracted, q0).squeeze(-1).contiguous()
-                batch_qubit_1 = torch.einsum('bsijk,kl->bsijl', contracted, q1).squeeze(-1).contiguous()
-
-            # Compute probabilities safely
-            prob_0 = torch.einsum('bsij,bsij->bs', batch_qubit_0.conj(), batch_qubit_0).real
-            prob_1 = torch.einsum('bsij,bsij->bs', batch_qubit_1.conj(), batch_qubit_1).real
-            total = prob_0 + prob_1
-
-            zero_mask = total == 0
-            prob_0 = torch.where(zero_mask, torch.full_like(prob_0, 0.5), prob_0)
-            prob_1 = torch.where(zero_mask, torch.full_like(prob_1, 0.5), prob_1)
-            total = prob_0 + prob_1
-            p0 = prob_0 / total
-
-            # Deterministic sampling if seed given
-            rnd = torch.rand(B, shots, device=circuit.device)
-            choose_1 = rnd > p0
-
-            batch_prev = torch.where(
-                choose_1.unsqueeze(-1).unsqueeze(-1),
-                batch_qubit_1,
-                batch_qubit_0
+        for group in groups:
+            idx = group['term_indices']
+            nonI_mask = (op_tensor[idx] != 0).to(device=device, dtype=torch.bool)  # (G, N)
+            group_coeffs = torch.as_tensor(
+                [all_coeffs[t] for t in idx], dtype=torch.float64, device=device
             )
 
-            mask = paulis_tensor[i].unsqueeze(0).unsqueeze(1).expand(B, shots, -1)
-            flip_mask = mask & choose_1.unsqueeze(-1)
-            batch_coefs = torch.where(flip_mask, -batch_coefs, batch_coefs)
+            rotated = rotate_tensor_for_measurement(ring_tensor_batch, group['basis'])
 
-        expectations = batch_coefs.sum(dim=2).mean(dim=1)
-        return expectations.detach().real.float()
+            shot_chunk = shots_per_group
+            totals = torch.zeros(B, dtype=torch.float64, device=device)
+            done = 0
 
-    
+            for s0 in range(0, shots_per_group, shot_chunk):
+                s1 = min(s0 + shot_chunk, shots_per_group)
+                S = s1 - s0
+                if S == 0:
+                    continue
+
+                batch_prev: torch.Tensor | None = None
+                bits = torch.empty((B, S, N), dtype=torch.bool, device=device)
+
+                for i in range(N):
+                    curr_tens = rotated[:, i].contiguous()
+
+                    if i == 0:
+                        qubit_0 = torch.einsum('bijk,kl->bijl', curr_tens, q0).squeeze(-1)
+                        qubit_1 = torch.einsum('bijk,kl->bijl', curr_tens, q1).squeeze(-1)
+                        batch_qubit_0 = qubit_0.unsqueeze(1).expand(-1, S, -1, -1).contiguous()
+                        batch_qubit_1 = qubit_1.unsqueeze(1).expand(-1, S, -1, -1).contiguous()
+                    else:
+                        contracted = torch.einsum('bsij,bjkl->bsikl', batch_prev, curr_tens)
+                        batch_qubit_0 = torch.einsum('bsijk,kl->bsijl', contracted, q0).squeeze(-1).contiguous()
+                        batch_qubit_1 = torch.einsum('bsijk,kl->bsijl', contracted, q1).squeeze(-1).contiguous()
+
+                    prob_0 = torch.einsum('bsij,bsij->bs', batch_qubit_0.conj(), batch_qubit_0).real
+                    prob_1 = torch.einsum('bsij,bsij->bs', batch_qubit_1.conj(), batch_qubit_1).real
+                    total = prob_0 + prob_1
+
+                    zero_mask = total == 0
+                    prob_0 = torch.where(zero_mask, torch.full_like(prob_0, 0.5), prob_0)
+                    prob_1 = torch.where(zero_mask, torch.full_like(prob_1, 0.5), prob_1)
+                    total = prob_0 + prob_1
+                    p0 = prob_0 / total
+
+                    rnd = torch.rand(B, S, device=device)
+                    choose_1 = rnd > p0
+                    bits[:, :, i] = choose_1
+
+                    batch_prev = torch.where(
+                        choose_1.unsqueeze(-1).unsqueeze(-1),
+                        batch_qubit_1,
+                        batch_qubit_0
+                    )
+
+                # Score using non-I mask for this group
+                bf = bits.to(torch.float32).reshape(B * S, N)
+                G = len(idx)
+                cnt = bf @ nonI_mask.to(torch.float32).T  # (B*S, G)
+                parity = (cnt.remainder_(2.0) > 0.5)
+                sgn = torch.where(parity, -1.0, 1.0)
+                Eb = (sgn * group_coeffs.view(1, -1)).sum(dim=1)  # (B*S,)
+
+                totals += Eb.view(B, S).sum(dim=1)
+                done += S
+
+            if done > 0:
+                grand_totals += totals / done
+
+        return grand_totals.float().detach()
+
+
+
+def _kron_contract_right(Prod, A0, A1, op=0):
+    """Contract Prod @ E(site) using Kronecker decomposition.
+
+    op=0 (I): E = conj(A0)⊗A0 + conj(A1)⊗A1
+    op=3 (Z): E = conj(A0)⊗A0 - conj(A1)⊗A1
+    op=1 (X): E = conj(A0)⊗A1 + conj(A1)⊗A0
+    op=2 (Y): E = -i·conj(A0)⊗A1 + i·conj(A1)⊗A0
+
+    Prod: (B, ..., l_bra, l_ket, r_bra, r_ket)  -- last 4 dims are spatial
+    A0, A1: (B, chi, chi)
+
+    Contracts r_bra/r_ket (last 2 dims of Prod) and produces new right indices.
+    A must broadcast over all dims between B and r_bra/r_ket (i.e., middle + l_bra + l_ket).
+    """
+    # Number of dims to broadcast over: everything between B (dim 0) and r_bra/r_ket (last 2)
+    n_broadcast = Prod.dim() - 3  # = n_middle + l_bra + l_ket
+    slices = (slice(None),) + (None,) * n_broadcast + (slice(None), slice(None))
+    A0H_e = A0.conj().mT[slices]
+    A1H_e = A1.conj().mT[slices]
+
+    if op == 0:  # I: conj(A0)⊗A0 + conj(A1)⊗A1
+        A0_e = A0[slices]
+        A1_e = A1[slices]
+        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
+        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+        return r0 + r1
+    elif op == 3:  # Z: conj(A0)⊗A0 - conj(A1)⊗A1
+        A0_e = A0[slices]
+        A1_e = A1[slices]
+        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
+        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+        return r0 - r1
+    elif op == 1:  # X: conj(A0)⊗A1 + conj(A1)⊗A0
+        A0_e = A0[slices]
+        A1_e = A1[slices]
+        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A1_e))
+        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A0_e))
+        return r0 + r1
+    else:  # op == 2, Y: -i·conj(A0)⊗A1 + i·conj(A1)⊗A0
+        A0_e = A0[slices]
+        A1_e = A1[slices]
+        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A1_e))
+        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A0_e))
+        return -1j * r0 + 1j * r1
+
+
+def _make_eye4(B, chi, ctype, device):
+    """Build the 4-D identity: eye4[b, i, j, i, j] = 1 for all i, j.
+
+    Corresponds to the chi^2 x chi^2 identity matrix in reshaped form.
+    """
+    eye2d = torch.eye(chi * chi, dtype=ctype, device=device)  # (chi^2, chi^2)
+    return eye2d.reshape(chi, chi, chi, chi).unsqueeze(0).expand(B, -1, -1, -1, -1)
+
 
 @torch.no_grad()
 def expectation_value_batch_efficient_contraction(
@@ -397,35 +614,38 @@ def expectation_value_batch_efficient_contraction(
     hamiltonian,                         # .get_bool_pauli_tensor()->(T,N); .coefficients (len T)
     shots: int,                          # kept for API compatibility (ignored)
     *,
-    term_chunk: Optional[int] = None,    # chunk across Hamiltonian terms
-    cache_double_layers: bool = False,   # True = cache E_I/E_Z per site (uses more memory)
+    term_chunk: Optional[int] = None,    # unused, kept for API compat
+    cache_double_layers: bool = True,    # cache A0/A1 per site
     param_chunk: Optional[int] = None,   # split B across chunks to fit memory
     use_complex64: bool = True,          # internal complex precision
 ) -> Tensor:
     """
-    Exact batched ⟨ψ|H|ψ⟩ via STREAMED double-layer contraction in MATRIX form.
+    Exact batched <psi|H|psi> via identity-chain factored Kronecker contraction.
 
-    - No rank-5 tensors kept around.
-    - Working set ~ O(B * chi^4) only for the CURRENT site/term-chunk.
-    - Returns (B,) float32 expectations.
+    Precomputes all-identity left-prefix and right-suffix products, then
+    contracts only at the sparse Z-sites of each Hamiltonian term.
+
+    Complexity: O((N + k*T) * B * chi^5)  instead of  O(N * T * B * chi^5)
+    Memory:     O(N * B * chi^4)  instead of  O(T * B * chi^4)
+
+    where k is the average number of Z-operators per Hamiltonian term.
     """
     device = getattr(circuit, "device", param_batch.device)
 
-    # Split param batch if desired
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
         batch_slices = [(0, B_total)]
     else:
-        batch_slices = []
-        for s in range(0, B_total, param_chunk):
-            batch_slices.append((s, min(s + param_chunk, B_total)))
+        batch_slices = [(s, min(s + param_chunk, B_total)) for s in range(0, B_total, param_chunk)]
 
     # Hamiltonian
-    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N)
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=torch.cfloat if use_complex64 else torch.cdouble, device=device)
-    T, N = paulis.shape
-    if term_chunk is None:
-        term_chunk = T
+    op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
+    coeffs = torch.as_tensor(
+        hamiltonian.coefficients,
+        dtype=torch.cfloat if use_complex64 else torch.cdouble,
+        device=device,
+    )
+    T, N = op_tensor.shape
 
     out_parts = []
 
@@ -438,145 +658,75 @@ def expectation_value_batch_efficient_contraction(
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
         ctype = torch.complex64 if use_complex64 else torch.complex128
-
         chi = l
-        chi2 = chi * chi
 
-        # Cache per-site A0, A1 slices for Kronecker-factored contraction
-        A0_all = ring[..., 0].to(ctype)  # (B, N, chi, chi)
-        A1_all = ring[..., 1].to(ctype)  # (B, N, chi, chi)
+        # Cache per-site A0/A1 slices
+        sites = []
+        for i in range(N):
+            Ab = ring[:, i].to(ctype)
+            sites.append((Ab[:, :, :, 0].contiguous(), Ab[:, :, :, 1].contiguous()))
+        del ring
 
-        # Use einsum for chi >= 8 (fused contraction faster), matmul for small chi
-        _use_einsum = chi >= 8
+        eye4 = _make_eye4(B, chi, ctype, device)
 
-        def _kron_right_batch(Prod_flat, A0_i, A1_i, mask_i, Tc):
-            """
-            Kronecker-factored Prod @ E per term, O(chi^5) instead of O(chi^6).
-
-            Prod_flat: (B*Tc, chi^2, chi^2)
-            A0_i, A1_i: (B, chi, chi)
-            mask_i: (Tc,) bool — True=Z, False=I
-
-            Returns: (B*Tc, chi^2, chi^2)
-            """
-            BT = B * Tc
-            A0_exp = A0_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
-            A1_exp = A1_i.unsqueeze(1).expand(-1, Tc, -1, -1).reshape(BT, chi, chi)
-
-            if _use_einsum:
-                # Fused 3-tensor einsum: fewer kernel launches, better for chi >= 8
-                Prod_5d = Prod_flat.reshape(BT, chi, chi, chi, chi)
-                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_exp.conj(), Prod_5d, A0_exp).reshape(BT, chi2, chi2)
-                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_exp.conj(), Prod_5d, A1_exp).reshape(BT, chi2, chi2)
-            else:
-                # 4 separate matmuls: lower overhead for small chi
-                Prod_4d = Prod_flat.reshape(BT, chi2, chi, chi)
-                temp = torch.matmul(Prod_4d, A0_exp.unsqueeze(1))
-                r0 = torch.matmul(A0_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
-                temp = torch.matmul(Prod_4d, A1_exp.unsqueeze(1))
-                r1 = torch.matmul(A1_exp.conj().mT.unsqueeze(1), temp).reshape(BT, chi2, chi2)
-
-            sign = torch.where(mask_i, -1.0, 1.0).to(ctype)
-            sign = sign.view(1, Tc, 1, 1).expand(B, Tc, 1, 1).reshape(BT, 1, 1)
-            return r0 + sign * r1
-
-        # ── Identity-chain factored contraction ──
-        # Precompute all-I left prefix and right suffix for all B circuits.
-        # Then per Hamiltonian term, contract only at non-I (Z) sites.
-        # This reduces per-term work from O(N × chi^5) to O(k × chi^5)
-        # where k = number of Z-sites per term (~2 for MaxCut).
-
-        # Per-site A0, A1: (B, chi, chi)
-        site_A0 = [A0_all[:, i].contiguous() for i in range(N)]
-        site_A1 = [A1_all[:, i].contiguous() for i in range(N)]
-
-        # Batched Kronecker right-multiply for identity: Prod @ E_I
-        def _kron_I_batch(Prod_flat, A0_i, A1_i):
-            """Prod @ E_I for B circuits, no term batching."""
-            if _use_einsum:
-                P5 = Prod_flat.reshape(B, chi, chi, chi, chi)
-                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_i.conj(), P5, A0_i).reshape(B, chi2, chi2)
-                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_i.conj(), P5, A1_i).reshape(B, chi2, chi2)
-            else:
-                P4 = Prod_flat.reshape(B, chi2, chi, chi)
-                t = torch.matmul(P4, A0_i.unsqueeze(1))
-                r0 = torch.matmul(A0_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
-                t = torch.matmul(P4, A1_i.unsqueeze(1))
-                r1 = torch.matmul(A1_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
-            return r0 + r1
-
-        def _kron_Z_batch(Prod_flat, A0_i, A1_i):
-            """Prod @ E_Z for B circuits."""
-            if _use_einsum:
-                P5 = Prod_flat.reshape(B, chi, chi, chi, chi)
-                r0 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A0_i.conj(), P5, A0_i).reshape(B, chi2, chi2)
-                r1 = torch.einsum('xbc,xaAbB,xBC->xaAcC', A1_i.conj(), P5, A1_i).reshape(B, chi2, chi2)
-            else:
-                P4 = Prod_flat.reshape(B, chi2, chi, chi)
-                t = torch.matmul(P4, A0_i.unsqueeze(1))
-                r0 = torch.matmul(A0_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
-                t = torch.matmul(P4, A1_i.unsqueeze(1))
-                r1 = torch.matmul(A1_i.conj().mT.unsqueeze(1), t).reshape(B, chi2, chi2)
-            return r0 - r1
-
-        # Precompute all-I left prefix: L_pre[i] = E_I(0) @ ... @ E_I(i-1)
-        eye_b = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+        # --- Precompute left prefix products under all-identity ---
+        # L_pre[i] = E_I(0) @ E_I(1) @ ... @ E_I(i-1),  L_pre[0] = I
+        # Uses right contraction: acc = acc @ E_I(i)
         L_pre = [None] * (N + 1)
-        acc = eye_b
+        acc = eye4
         for i in range(N):
             L_pre[i] = acc
-            acc = _kron_I_batch(acc, site_A0[i], site_A1[i])
+            A0_i, A1_i = sites[i]
+            acc = _kron_contract_right(acc, A0_i, A1_i)
         L_pre[N] = acc
+        del acc
 
-        # Precompute all-I right suffix (transposed for trace):
-        # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T
+        # --- Precompute TRANSPOSED right suffix products under all-identity ---
+        # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T = E_I(N-1)^T @ ... @ E_I(i)^T
+        # R_suf_T[N] = I
+        # Since E_I^T uses A^T instead of A, we pass A.mT to the right-contraction.
+        # Trace formula: Tr(run @ R_suf[i]) = (run * R_suf_T[i]).sum(dims 1..4)
         R_suf_T = [None] * (N + 1)
-        R_suf_T[N] = eye_b
-        acc = eye_b
+        acc = eye4
         for i in range(N - 1, -1, -1):
-            A0_mT = site_A0[i].mT.contiguous()
-            A1_mT = site_A1[i].mT.contiguous()
-            acc = _kron_I_batch(acc, A0_mT, A1_mT)
+            A0_i, A1_i = sites[i]
+            acc = _kron_contract_right(acc, A0_i.mT, A1_i.mT)
             R_suf_T[i] = acc
-        del acc, eye_b
+        R_suf_T[N] = eye4
+        del acc, eye4
 
-        # Per-term contraction: only at Z-sites
+        # --- Per-term contraction: only at non-identity sites ---
         totals = torch.zeros(B, dtype=ctype, device=device)
 
         for t in range(T):
-            z_sites = torch.where(paulis[t])[0].tolist()
+            non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()
 
-            if len(z_sites) == 0:
-                # All identity: trace of full ring
-                totals += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2))
+            if len(non_i_sites) == 0:
+                # All identity: Tr(full ring) = (L_pre[N] * R_suf_T[N]).sum
+                totals += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
                 continue
 
-            s_first = z_sites[0]
-            s_last = z_sites[-1]
+            s_first = non_i_sites[0]
+            s_last = non_i_sites[-1]
 
+            # Start from the precomputed left prefix up to the first non-I site
             run = L_pre[s_first].clone()
+
+            # Contract through sites s_first..s_last
             for i in range(s_first, s_last + 1):
-                if paulis[t, i]:
-                    run = _kron_Z_batch(run, site_A0[i], site_A1[i])
-                else:
-                    run = _kron_I_batch(run, site_A0[i], site_A1[i])
+                A0_i, A1_i = sites[i]
+                op_i = op_tensor[t, i].item()
+                run = _kron_contract_right(run, A0_i, A1_i, op=op_i)
 
-            # Trace: Tr(run @ R_suf) = (run * R_suf_T).sum()
-            totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2))
+            # Tr(run @ R_suf[s_last+1]) = element-wise product with transposed suffix
+            totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
 
-        del L_pre, R_suf_T
+        out_parts.append(totals.real.float())
 
-        out_parts.append(totals.real.float())  # (B,)
+        del sites, L_pre, R_suf_T, totals
 
-        # free per param-chunk tensors
-        del ring, totals
-        torch.cuda.empty_cache()
-
-    # concat across param chunks
     return torch.cat(out_parts, dim=0)
 
-import torch
-from typing import Optional
 
 @torch.no_grad()
 def expectation_value_batch_right_suffix(
@@ -601,7 +751,7 @@ def expectation_value_batch_right_suffix(
     """
     device = getattr(circuit, "device", param_batch.device)
     ctype = torch.complex64 if use_complex64 else torch.complex128
-    
+
     B_total = int(param_batch.shape[0])
     if param_chunk is None or param_chunk >= B_total:
         batch_slices = [(0, B_total)]
@@ -611,10 +761,12 @@ def expectation_value_batch_right_suffix(
     if chunk_size is None:
         chunk_size = shots
 
-    # Hamiltonian data (shared for all param chunks)
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=torch.float64, device=device)  # (T,)
-    zmask  = hamiltonian.get_bool_pauli_tensor().to(device=device, dtype=torch.bool)        # (T, N)
-    T, N   = int(coeffs.numel()), int(zmask.shape[1])
+    # QWC groups and Hamiltonian data
+    groups = hamiltonian.get_qwc_groups()
+    op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
+    all_coeffs = hamiltonian.coefficients
+    N = op_tensor.shape[1]
+    shots_per_group = max(1, shots // len(groups))
 
     # RNG
     gen = torch.Generator(device=device)
@@ -624,170 +776,118 @@ def expectation_value_batch_right_suffix(
     out_parts = []
 
     for lo, hi in batch_slices:
-        # ---- Build Tensor-Ring cores for this param sub-batch
-        param_view = param_batch[lo:hi]                      # (B, P)
+        param_view = param_batch[lo:hi]
         B = int(param_view.shape[0])
-        ring = circuit.build_tensor_batch(param_view, B)     # (B, N, χ, χ, 2)
+        ring = circuit.build_tensor_batch(param_view, B)     # (B, N, chi, chi, 2)
         _, N_chk, chi_l, chi_r, d = ring.shape
         assert N_chk == N and d == 2 and chi_l == chi_r, "Mismatch in circuit vs. Hamiltonian."
         chi = chi_l
+        chi2 = chi * chi
 
-        # ---- Precompute right-suffix objects per-parameter, stack across B
-        # We only need the *R4* suffix tensors for sampling:
-        #   R4[i] shape (χ,χ,χ,χ) per parameter -> stack to (B,χ,χ,χ,χ) per site.
-        # We also prepare A0/A1 per site stacked across B.
-        R4_stack = []
-        A0_stack = []
-        A1_stack = []
-        # precompute_double_layer_and_right_suffix expects a single-(N,χ,χ,2) ring per parameter
-        for b in range(B):
-            Es, R_suf, d2, _, _ = precompute_double_layer_and_right_suffix(ring[b])
-            # Cast once to consistent dtype and layout
-            R4_b = [Ri.to(ctype).view(chi, chi, chi, chi).permute(2, 3, 0, 1).contiguous()
-                    for Ri in R_suf]  # -> (χ,χ,χ,χ) with indices (a,c,b,d) order used below
-            A0_b = [ring[b, i, :, :, 0].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
-            A1_b = [ring[b, i, :, :, 1].to(ctype).contiguous() for i in range(N)]  # (χ,χ)
-            R4_stack.append(R4_b)
-            A0_stack.append(A0_b)
-            A1_stack.append(A1_b)
+        grand_totals = torch.zeros(B, dtype=torch.float64, device=device)
 
-        # Now stack across B for each site i -> tensors:
-        #   R4_sites[i] : (B, χ,χ,χ,χ); A0_sites[i]/A1_sites[i] : (B, χ,χ)
-        R4_sites = [torch.stack([R4_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
-        A0_sites = [torch.stack([A0_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
-        A1_sites = [torch.stack([A1_stack[b][i] for b in range(B)], dim=0) for i in range(N)]
+        for group in groups:
+            idx = group['term_indices']
+            nonI_mask = (op_tensor[idx] != 0).to(device=device, dtype=torch.bool)  # (G, N)
+            group_coeffs = torch.as_tensor(
+                [all_coeffs[t] for t in idx], dtype=torch.float64, device=device
+            )
+            G = len(idx)
 
-        # ---- Monte Carlo accumulation over shot-chunks
-        totals = torch.zeros(B, dtype=torch.float64, device=device)
-        done   = torch.zeros((), dtype=torch.int64, device=device)
+            # Rotate ring for this group's measurement basis
+            rotated = rotate_tensor_for_measurement(ring, group['basis'])
 
-        Ichi = torch.eye(chi, dtype=ctype, device=device)
+            A0_sites = [rotated[:, i, :, :, 0].to(ctype).contiguous() for i in range(N)]
+            A1_sites = [rotated[:, i, :, :, 1].to(ctype).contiguous() for i in range(N)]
 
-        for s0 in range(0, shots, chunk_size):
-            s1 = min(s0 + chunk_size, shots)
-            S  = s1 - s0
+            # Build R_suf via Kronecker-free O(chi^5) contraction
+            acc = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+            R_suf = [None] * N
+            for i in range(N - 1, -1, -1):
+                R_suf[i] = acc
+                A0i, A1i = A0_sites[i], A1_sites[i]
+                acc_view = acc.view(B, chi, chi, chi2)
+                temp = torch.matmul(A0i.conj().unsqueeze(1), acc_view)
+                new_acc = torch.matmul(A0i, temp.reshape(B, chi, chi * chi2))
+                del temp
+                temp = torch.matmul(A1i.conj().unsqueeze(1), acc_view)
+                new_acc += torch.matmul(A1i, temp.reshape(B, chi, chi * chi2))
+                del temp
+                acc = new_acc.view(B, chi, chi, chi2).reshape(B, chi2, chi2).contiguous()
+                del new_acc
+            del acc
 
-            # X: (B,S,χ,χ), start as identity per (B,S)
-            X = Ichi.expand(B, S, chi, chi).clone()
-            # bits: (B,S,N) bool
-            bits = torch.empty((B, S, N), dtype=torch.bool, device=device)
-
-            # Sweep sites
+            # Convert R_suf from kron convention to bilinear form
             for i in range(N):
-                A0i = A0_sites[i]                    # (B, χ, χ)
-                A1i = A1_sites[i]                    # (B, χ, χ)
-                R4i = R4_sites[i]                    # (B, χ, χ, χ, χ)
+                R_suf[i] = (R_suf[i].view(B, chi, chi, chi, chi)
+                            .permute(0, 3, 1, 4, 2)
+                            .conj()
+                            .contiguous()
+                            .reshape(B, chi2, chi2))
 
-                # Broadcast A* to (B,S,χ,χ) for batched matmul
-                A0i_bs = A0i.unsqueeze(1)            # (B,1,χ,χ)
-                A1i_bs = A1i.unsqueeze(1)            # (B,1,χ,χ)
+            # Monte Carlo accumulation over shot-chunks
+            totals = torch.zeros(B, dtype=torch.float64, device=device)
+            done = torch.zeros((), dtype=torch.int64, device=device)
 
-                M0 = torch.matmul(X, A0i_bs)         # (B,S,χ,χ)
-                M1 = torch.matmul(X, A1i_bs)         # (B,S,χ,χ)
+            Ichi = torch.eye(chi, dtype=ctype, device=device)
 
-                # Weights w0, w1 ∝ ⟨Mσ| R4 |Mσ⟩  (σ in {0,1}) — keep real part for probs
-                # Indices: M0 -> (B,S,a,b); M0.conj -> (B,S,c,d); R4 -> (B,a,c,b,d)  => (B,S)
-                # w0 = torch.einsum('bsab,bscd,bacbd->bs', M0, M0.conj(), R4i).real
-                # w1 = torch.einsum('bsab,bscd,bacbd->bs', M1, M1.conj(), R4i).real
-                w0 = torch.einsum('xsab,xscd,xacbd->xs', M0, M0.conj(), R4i).real
-                w1 = torch.einsum('xsab,xscd,xacbd->xs', M1, M1.conj(), R4i).real
-                den = (w0 + w1).clamp_min(1e-300)
-                p1  = (w1 / den)                      # (B,S)
+            for s0 in range(0, shots_per_group, chunk_size):
+                s1 = min(s0 + chunk_size, shots_per_group)
+                S = s1 - s0
 
-                u   = torch.rand((B, S), generator=gen, device=device)
-                si  = (u < p1)                        # True => choose 1, else 0
-                bits[:, :, i] = si
+                X = Ichi.expand(B, S, chi, chi).clone()
+                bits = torch.empty((B, S, N), dtype=torch.bool, device=device)
 
-                si_view = si.view(B, S, 1, 1)
-                X = torch.where(si_view, M1, M0)      # select next prefix
+                for i in range(N):
+                    A0i = A0_sites[i]
+                    A1i = A1_sites[i]
+                    Ri = R_suf[i]
 
-                # Periodic normalization for numerical stability
-                if normalize_every > 0 and (i % normalize_every) == 0 and i != 0:
-                    nX = torch.linalg.norm(X.reshape(B, S, -1), dim=-1).clamp_min(1e-300).view(B, S, 1, 1)
-                    X = X / nX
+                    M0 = torch.matmul(X, A0i.unsqueeze(1))
+                    M1 = torch.matmul(X, A1i.unsqueeze(1))
 
-            # ---- Energy for this shot-chunk, streamed over term-chunks
-            # bits: (B,S,N)
-            bf = bits.to(torch.float32).reshape(B * S, N)  # (B*S, N)
-            Eb = torch.zeros((B * S,), dtype=torch.float64, device=device)
+                    v0 = M0.reshape(B, S, chi2)
+                    v1 = M1.reshape(B, S, chi2)
+                    y0 = torch.matmul(v0, Ri.mT)
+                    y1 = torch.matmul(v1, Ri.mT)
+                    w0 = (v0.conj() * y0).sum(-1).real
+                    w1 = (v1.conj() * y1).sum(-1).real
+                    den = (w0 + w1).clamp_min(1e-300)
+                    p1 = (w1 / den)
 
-            for t0 in range(0, T, term_chunk):
-                t1   = min(t0 + term_chunk, T)
-                Zblk = zmask[t0:t1, :]                     # (Tc, N) bool
-                Cblk = coeffs[t0:t1]                       # (Tc,) float64
+                    u = torch.rand((B, S), generator=gen, device=device)
+                    si = (u < p1)
+                    bits[:, :, i] = si
 
-                cnt = bf @ Zblk.to(torch.float32).T        # (B*S, Tc)
-                parity = (cnt.remainder_(2.0) > 0.5)       # True if odd number of Z -> -1
-                sgn = torch.where(parity, -1.0, 1.0)       # (B*S, Tc)
-                Eb += (sgn * Cblk.view(1, -1)).sum(dim=1)  # (B*S,)
+                    si_view = si.view(B, S, 1, 1)
+                    X = torch.where(si_view, M1, M0)
 
-            # Reduce samples -> per-B totals
-            Eb = Eb.view(B, S)
-            totals += Eb.sum(dim=1)
-            done   += S
+                    if normalize_every > 0 and (i % normalize_every) == 0 and i != 0:
+                        nX = torch.linalg.norm(X.reshape(B, S, -1), dim=-1).clamp_min(1e-300).view(B, S, 1, 1)
+                        X = X / nX
 
-        out_parts.append((totals / done.clamp_min(1)).detach())  # (B,)
+                # Score using non-I mask for this group
+                bf = bits.to(torch.float32).reshape(B * S, N)
+                cnt = bf @ nonI_mask.to(torch.float32).T  # (B*S, G)
+                parity = (cnt.remainder_(2.0) > 0.5)
+                sgn = torch.where(parity, -1.0, 1.0)
+                Eb = (sgn * group_coeffs.view(1, -1)).sum(dim=1)  # (B*S,)
 
-        # Free per-chunk buffers
-        del ring, R4_stack, A0_stack, A1_stack, R4_sites, A0_sites, A1_sites
+                Eb = Eb.view(B, S)
+                totals += Eb.sum(dim=1)
+                done += S
+
+            if done > 0:
+                grand_totals += (totals / done.clamp_min(1)).detach()
+
+            del R_suf, A0_sites, A1_sites
+
+        out_parts.append(grand_totals)
+
+        del ring
         torch.cuda.empty_cache()
 
-    # Concatenate across parameter chunks and move to CPU
     return torch.cat(out_parts, dim=0).cpu()
-
-
-
-import torch
-
-def _maybe_compile(fn):
-    try:
-        # cheap compile setting; avoids the heavy max-autotune path
-        return torch.compile(fn, mode="reduce-overhead", fullgraph=False, dynamic=False)
-    except Exception:
-        return fn
-
-def _site_sweep_impl(X, A0, A1, R4, U, normalize_every: int):
-    """
-    X: (S, χ, χ)  complex64
-    A0/A1: (N, χ, χ) complex64
-    R4: list of length N, each (χ, χ, χ, χ) complex64
-    U: (S, N) float32 uniforms in [0,1)
-    returns:
-        bits: (S, N) bool
-        X:    (S, χ, χ) complex64 (final state after N)
-    """
-    S, chi, _ = X.shape
-    N = A0.shape[0]
-    bits = torch.empty((S, N), dtype=torch.bool, device=X.device)
-
-    for i in range(N):
-        A0i = A0[i]
-        A1i = A1[i]
-        R4i = R4[i]
-
-        M0 = X @ A0i                  # (S, χ, χ)
-        M1 = X @ A1i
-
-        # one einsum for both branches
-        M  = torch.stack((M0, M1), dim=1)  # (S, 2, χ, χ)
-        w  = torch.einsum('skab,skcd,acbd->sk', M, M.conj(), R4i).real  # (S,2)
-        den = (w.sum(dim=1)).clamp_min_(1e-30)
-        p0  = (w[:, 0] / den)
-
-        si  = (U[:, i] >= p0)         # (S,) bool
-        bits[:, i] = si
-        X = torch.where(si.view(S,1,1), M1, M0)
-
-        if (i % normalize_every) == 0 and i != 0:
-            nX = torch.linalg.norm(X.reshape(S, -1), dim=1).clamp_min_(1e-30).view(S,1,1)
-            X  = X / nX
-
-    return bits, X
-
-
-import torch
-from torch import Tensor
-from typing import Optional
 
 @torch.no_grad()
 def expectation_value_batch_correct_sampling(
@@ -816,118 +916,106 @@ def expectation_value_batch_correct_sampling(
     cdtype = torch.complex64 if (use_fp32_env and cores.dtype in (torch.complex64, torch.complex128)) else cores.dtype
     rtype  = torch.float64  # final return dtype
 
-    # Per-site slices (avoid python lists of huge tensors where possible)
-    A0 = cores[..., 0].contiguous()   # (B, n, chi, chi)
-    A1 = cores[..., 1].contiguous()   # (B, n, chi, chi)
+    # ----- 2) QWC groups and Hamiltonian -----
+    groups = hamiltonian.get_qwc_groups()
+    op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, n) uint8
+    all_coeffs = hamiltonian.coefficients
+    shots_per_group = max(1, shots // len(groups))
 
-    # ----- 2) Hamiltonian (streamed) -----
-    coeffs = torch.as_tensor(hamiltonian.coefficients, dtype=rtype, device=device)  # (T,)
-    zmask  = hamiltonian.get_bool_pauli_tensor().to(device=device, dtype=torch.bool)  # (T, n)
-    if zmask.shape[1] != n:
-        raise ValueError(f"Pauli mask width ({zmask.shape[1]}) != number of sites ({n})")
-    T = int(coeffs.numel())
-
-    # ----- 3) Build right suffix R_suf[i] using O(chi^5) Kronecker factoring -----
     chi2 = chi * chi
     env_dtype = torch.complex64 if use_fp32_env else cdtype
 
-    R_suf = [None] * n
-    acc = torch.eye(chi2, dtype=env_dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+    def E_from_slices(A0i: Tensor, A1i: Tensor) -> Tensor:
+        E0 = torch.einsum('bij,bkl->bikjl', A0i.conj(), A0i).reshape(B, chi2, chi2)
+        E1 = torch.einsum('bij,bkl->bikjl', A1i.conj(), A1i).reshape(B, chi2, chi2)
+        return (E0 + E1).to(env_dtype)
 
-    for i in range(n - 1, -1, -1):
-        R_suf[i] = acc
-        A0i = A0[:, i].to(env_dtype)  # (B, chi, chi)
-        A1i = A1[:, i].to(env_dtype)
-
-        # Left-multiply: acc_new = E_i @ acc in O(chi^5) via Kronecker factoring
-        acc_4d = acc.reshape(B, chi, chi, chi2)  # (B, b, b', D)
-
-        # A0 contribution
-        temp = torch.matmul(A0i.unsqueeze(1), acc_4d)  # (B, chi, chi, chi2)
-        new_acc = torch.bmm(A0i.conj(), temp.reshape(B, chi, chi * chi2))  # (B, chi, chi*chi2)
-
-        # A1 contribution
-        temp = torch.matmul(A1i.unsqueeze(1), acc_4d)
-        new_acc = new_acc + torch.bmm(A1i.conj(), temp.reshape(B, chi, chi * chi2))
-
-        acc = new_acc.reshape(B, chi, chi, chi2).reshape(B, chi2, chi2).contiguous()
-        del new_acc, temp
-
-    del acc
-    torch.cuda.empty_cache()
-
-    # ----- 4) Sampler over shots (in chunks) -----
+    # ----- 3) RNG -----
     gen = torch.Generator(device=device)
     if seed is not None:
         gen.manual_seed(seed)
 
     if shot_chunk is None:
-        shot_chunk = shots
+        shot_chunk = shots_per_group
 
-    total = torch.zeros(B, dtype=rtype, device=device)
-    done  = 0
+    grand_total = torch.zeros(B, dtype=rtype, device=device)
 
-    # Pre-allocate per-chunk work buffers to avoid reallocs
-    eye_chi = torch.eye(chi, dtype=cdtype, device=device)
-    for s0 in range(0, shots, shot_chunk):
-        s1 = min(s0 + shot_chunk, shots)
-        S  = s1 - s0
+    for group in groups:
+        idx = group['term_indices']
+        nonI_mask = (op_tensor[idx] != 0).to(device=device, dtype=torch.bool)  # (G, n)
+        group_coeffs = torch.as_tensor(
+            [all_coeffs[t] for t in idx], dtype=rtype, device=device
+        )
+        G = len(idx)
 
-        X    = eye_chi.expand(B, S, chi, chi).clone()    # (B,S,chi,chi)
-        bits = torch.empty((B, S, n), dtype=torch.bool, device=device)
+        # Rotate cores for this group's measurement basis
+        rotated = rotate_tensor_for_measurement(cores, group['basis'])
+        A0 = rotated[..., 0].contiguous()   # (B, n, chi, chi)
+        A1 = rotated[..., 1].contiguous()
 
-        for i in range(n):
-            A0i = A0[:, i].unsqueeze(1)                  # (B,1,chi,chi)
-            A1i = A1[:, i].unsqueeze(1)                  # (B,1,chi,chi)
+        # ----- Build R_suf for rotated cores -----
+        Id = torch.eye(chi2, dtype=env_dtype, device=device).expand(B, chi2, chi2).clone()
+        R_suf = [None] * n
+        acc = Id
+        for i in range(n - 1, -1, -1):
+            R_suf[i] = acc
+            Ei = E_from_slices(A0[:, i], A1[:, i])
+            acc = torch.bmm(Ei, acc)
+            del Ei
+        del acc, Id
 
-            M0 = torch.matmul(X, A0i)                    # (B,S,chi,chi)
-            M1 = torch.matmul(X, A1i)                    # (B,S,chi,chi)
+        # ----- Sampler over shots (in chunks) -----
+        total = torch.zeros(B, dtype=rtype, device=device)
+        done = 0
 
-            # --- Memory-optimized weights via χ² bilinear form (NO R4) ---
-            # v = vec(M) with row-major reshape consistent with E construction
-            v0 = M0.reshape(B, S, chi2)                  # (B,S,chi^2)
-            v1 = M1.reshape(B, S, chi2)
+        eye_chi = torch.eye(chi, dtype=cdtype, device=device)
+        for s0 in range(0, shots_per_group, shot_chunk):
+            s1 = min(s0 + shot_chunk, shots_per_group)
+            S = s1 - s0
 
-            Ri = R_suf[i]                                # (B,chi^2,chi^2), complex
-            # y = R * v  without expanding R along S
-            y0 = torch.einsum('bij,bsj->bsi', Ri, v0)    # (B,S,chi^2)
-            y1 = torch.einsum('bij,bsj->bsi', Ri, v1)
+            X = eye_chi.expand(B, S, chi, chi).clone()
+            bits = torch.empty((B, S, n), dtype=torch.bool, device=device)
 
-            # w = v* · y
-            w0 = (v0.conj() * y0).sum(dim=-1).real       # (B,S)
-            w1 = (v1.conj() * y1).sum(dim=-1).real
+            for i in range(n):
+                A0i = A0[:, i].unsqueeze(1)
+                A1i = A1[:, i].unsqueeze(1)
 
-            den = (w0 + w1).clamp_min(1e-300)
-            p0  = (w0 / den).to(rtype)                   # (B,S)
-            si  = (torch.rand((B, S), generator=gen, device=device) >= p0)
-            bits[:, :, i] = si
-            X = torch.where(si.unsqueeze(-1).unsqueeze(-1), M1, M0)
+                M0 = torch.matmul(X, A0i)
+                M1 = torch.matmul(X, A1i)
 
-            # Optional per-site stabilization (cheap; keeps memory flat)
-            # nX = torch.linalg.norm(X.reshape(B, S, -1), dim=2).clamp_min(1e-300).view(B, S, 1, 1)
-            # X = X / nX
+                v0 = M0.reshape(B, S, chi2)
+                v1 = M1.reshape(B, S, chi2)
 
-            del M0, M1, v0, v1, y0, y1  # free per-site temporaries
+                Ri = R_suf[i]
+                y0 = torch.einsum('bij,bsj->bsi', Ri, v0)
+                y1 = torch.einsum('bij,bsj->bsi', Ri, v1)
 
-        # ---- 5) Streamed scoring over terms ----
-        Eb = torch.zeros((B, S), dtype=rtype, device=device)
-        bf = bits.to(torch.float32)
-        for t0 in range(0, T, term_chunk):
-            t1 = min(t0 + term_chunk, T)
-            Zblk = zmask[t0:t1, :]                            # (Tc,n)
-            Cblk = coeffs[t0:t1]                              # (Tc,)
-            cnt  = torch.einsum('bsn,tn->bst', bf, Zblk.float())
-            sgn  = torch.where((cnt.remainder_(2.0) > 0.5), -1.0, 1.0).to(rtype)
-            Eb  += torch.einsum('bst,t->bs', sgn, Cblk)
+                w0 = (v0.conj() * y0).sum(dim=-1).real
+                w1 = (v1.conj() * y1).sum(dim=-1).real
 
-        total += Eb.sum(dim=1)    # sum shots
-        done  += S
+                den = (w0 + w1).clamp_min(1e-300)
+                p0 = (w0 / den).to(rtype)
+                si = (torch.rand((B, S), generator=gen, device=device) >= p0)
+                bits[:, :, i] = si
+                X = torch.where(si.unsqueeze(-1).unsqueeze(-1), M1, M0)
 
-        del X, bits, Eb, bf
-        torch.cuda.empty_cache()
+                del M0, M1, v0, v1, y0, y1
 
-    # free big envs
-    del R_suf, A0, A1, cores
-    torch.cuda.empty_cache()
+            # Score using non-I mask for this group
+            bf = bits.to(torch.float32)
+            cnt = torch.einsum('bsn,gn->bsg', bf, nonI_mask.float())  # (B, S, G)
+            sgn = torch.where((cnt.remainder_(2.0) > 0.5), -1.0, 1.0).to(rtype)
+            Eb = torch.einsum('bsg,g->bs', sgn, group_coeffs)
 
-    return total / max(1, done)   # (B,), float64
+            total += Eb.sum(dim=1)
+            done += S
+
+            del X, bits, Eb, bf
+
+        if done > 0:
+            grand_total += total / done
+
+        del R_suf, A0, A1
+
+    del cores
+    return grand_total
