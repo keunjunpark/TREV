@@ -29,9 +29,33 @@ from ...gates.parameter_gates import (
 from ...gates.non_parameter_gates import (
     NonParameterOneQubitGate,
     NonParameterTwoQubitsGate,
-    _swap_gate_matrix,
 )
+from ...gates.info import SWAP as _get_swap_matrix
 from .gradient import Gradient
+
+
+def _swap_gate_matrix(gate_mat):
+    """Swap the qubit ordering of a 4x4 gate matrix: U(q0,q1) -> U(q1,q0)."""
+    g = gate_mat.reshape(2, 2, 2, 2)
+    return g.permute(1, 0, 3, 2).reshape(4, 4)
+
+
+def _swap_route_apply(cores, q0, q1, gate_mat, dtype, N):
+    """Apply 2q gate on non-adjacent qubits via SWAP routing."""
+    swap_mat = _get_swap_matrix(device=cores[0].device).to(dtype)
+    lo, hi = min(q0, q1), max(q0, q1)
+    # SWAP lo toward hi-1
+    for s in range(lo, hi - 1):
+        cores[s], cores[s + 1] = _apply_2q_diff(swap_mat, cores[s], cores[s + 1], dtype)
+    # Apply gate on (hi-1, hi) — now adjacent
+    if q0 < q1:
+        cores[hi - 1], cores[hi] = _apply_2q_diff(gate_mat, cores[hi - 1], cores[hi], dtype)
+    else:
+        cores[hi - 1], cores[hi] = _apply_2q_diff(
+            _swap_gate_matrix(gate_mat), cores[hi - 1], cores[hi], dtype)
+    # SWAP back
+    for s in range(hi - 2, lo - 1, -1):
+        cores[s], cores[s + 1] = _apply_2q_diff(swap_mat, cores[s], cores[s + 1], dtype)
 
 
 def _apply_2q_diff(gate_matrix, qu0, qu1, dtype):
@@ -66,7 +90,7 @@ def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
     for i in range(N):
         cores[i][0, 0, 0] = 1.0
         noise = torch.randn(chi, chi, 2, generator=gen, device=device, dtype=torch.float32)
-        cores[i] = cores[i] + 1e-8 * noise.to(dtype)
+        cores[i] = cores[i] + 1e-4 * noise.to(dtype)
 
     for gate in circuit.gates:
         if isinstance(gate, ParameterMultiOneQubitGate):
@@ -83,34 +107,40 @@ def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
             q0, q1 = gate.qubits
             mat = gate.matrix_fun(theta[gate.theta_index], device).to(dtype)
             _lo, _hi = min(q0, q1), max(q0, q1)
-            is_wrap = (_lo == 0 and _hi == N - 1)
-            if is_wrap:
-                if q0 == N - 1 and q1 == 0:
-                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+            is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
+            if is_adj:
+                if _lo == 0 and _hi == N - 1:
+                    if q0 == N - 1 and q1 == 0:
+                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                    else:
+                        cores[N-1], cores[0] = _apply_2q_diff(
+                            _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+                elif q0 < q1:
+                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
                 else:
-                    cores[N-1], cores[0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
-            elif q0 < q1:
-                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+                    cores[q1], cores[q0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
             else:
-                cores[q1], cores[q0] = _apply_2q_diff(
-                    _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
+                _swap_route_apply(cores, q0, q1, mat, dtype, N)
         elif isinstance(gate, NonParameterTwoQubitsGate):
             q0, q1 = gate.qubits
             mat = gate.matrix_fun(device=device).to(dtype)
             _lo, _hi = min(q0, q1), max(q0, q1)
-            is_wrap = (_lo == 0 and _hi == N - 1)
-            if is_wrap:
-                if q0 == N - 1 and q1 == 0:
-                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+            is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
+            if is_adj:
+                if _lo == 0 and _hi == N - 1:
+                    if q0 == N - 1 and q1 == 0:
+                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                    else:
+                        cores[N-1], cores[0] = _apply_2q_diff(
+                            _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+                elif q0 < q1:
+                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
                 else:
-                    cores[N-1], cores[0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
-            elif q0 < q1:
-                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+                    cores[q1], cores[q0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
             else:
-                cores[q1], cores[q0] = _apply_2q_diff(
-                    _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
+                _swap_route_apply(cores, q0, q1, mat, dtype, N)
 
     return torch.stack(cores, dim=0)
 
