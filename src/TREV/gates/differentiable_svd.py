@@ -60,7 +60,7 @@ class TruncatedSVD(torch.autograd.Function):
         Vh = Vh_full[:r, :]
         V = Vh.mH
 
-        eps = 1e-6 if S.dtype == torch.float64 else 1e-4
+        eps = 1e-12 if S.dtype == torch.float64 else 1e-6
 
         # ── TensorKit.jl convention: inv_diff = 1/(Sj - Si), inv_sum = 1/(Sj + Si) ──
         S_col = S.unsqueeze(-2)  # (1, r) = Sj
