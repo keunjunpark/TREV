@@ -257,7 +257,7 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
         term_chunk: max Hamiltonian terms to batch. None = auto from GPU memory.
 
     Returns:
-        (P,) float32 gradient tensor
+        (grad, loss_value): (P,) float32 gradient, scalar expectation value
     """
     real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
     N, chi = circuit.num_qubit, circuit.rank
@@ -270,8 +270,9 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
         tensor = _build_tensor_diff(theta_ad, circuit, dtype)
         loss = _contraction_diff_vectorized(tensor, hamiltonian, dtype,
                                             term_chunk=term_chunk)
+        loss_val = loss.detach().float().item()
         loss.backward()
-    return theta_ad.grad.float()
+    return theta_ad.grad.float(), loss_val
 
 
 class AutogradGradient(Gradient):
@@ -293,6 +294,7 @@ class AutogradGradient(Gradient):
         self.term_chunk = term_chunk
         self._verbose = True
         self._printed = False
+        self.last_exp_value = None  # cached from forward pass
 
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
         N, chi = circuit.num_qubit, circuit.rank
@@ -310,5 +312,7 @@ class AutogradGradient(Gradient):
             )
             self._printed = True
 
-        return autograd_gradient(theta, circuit, hamiltonian, self.dtype,
-                                 term_chunk=tc)
+        grad, exp_val = autograd_gradient(theta, circuit, hamiltonian, self.dtype,
+                                          term_chunk=tc)
+        self.last_exp_value = exp_val
+        return grad

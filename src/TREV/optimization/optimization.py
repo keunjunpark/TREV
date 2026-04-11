@@ -53,7 +53,11 @@ def minimize(
             iteration_times.append(time.time() - it_time)
 
             # --- expectation value ---
-            exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
+            # Reuse cached value from autograd forward pass if available
+            if hasattr(gradient, 'last_exp_value') and gradient.last_exp_value is not None:
+                exp_value = gradient.last_exp_value
+            else:
+                exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
             exp_values.append(exp_value)
 
             # --- best result method ---
