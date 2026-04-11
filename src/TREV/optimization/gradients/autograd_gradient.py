@@ -21,10 +21,15 @@ from ...hamiltonian.hamiltonian import Hamiltonian
 from ...measure.enums import MeasureMethod
 from ...gates.contraction import _apply_single_qubit_gate
 from ...gates.differentiable_svd import diff_svd
-from ...gates.parameter_gates import ParameterOneQubitGate
+from ...gates.parameter_gates import (
+    ParameterOneQubitGate,
+    ParameterMultiOneQubitGate,
+    ParameterTwoQubitGate,
+)
 from ...gates.non_parameter_gates import (
     NonParameterOneQubitGate,
     NonParameterTwoQubitsGate,
+    _swap_gate_matrix,
 )
 from .gradient import Gradient
 
@@ -64,17 +69,48 @@ def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
         cores[i] = cores[i] + 1e-8 * noise.to(dtype)
 
     for gate in circuit.gates:
-        if isinstance(gate, ParameterOneQubitGate):
+        if isinstance(gate, ParameterMultiOneQubitGate):
+            params = torch.stack([theta[i] for i in gate.theta_indices])
+            mat = gate.matrix_fun(params, device).to(dtype)
+            cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
+        elif isinstance(gate, ParameterOneQubitGate):
             mat = gate.matrix_fun(theta[gate.theta_index], device).to(dtype)
             cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
         elif isinstance(gate, NonParameterOneQubitGate):
             mat = gate.matrix_fun(None, device).to(dtype)
             cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
+        elif isinstance(gate, ParameterTwoQubitGate):
+            q0, q1 = gate.qubits
+            mat = gate.matrix_fun(theta[gate.theta_index], device).to(dtype)
+            _lo, _hi = min(q0, q1), max(q0, q1)
+            is_wrap = (_lo == 0 and _hi == N - 1)
+            if is_wrap:
+                if q0 == N - 1 and q1 == 0:
+                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                else:
+                    cores[N-1], cores[0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+            elif q0 < q1:
+                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+            else:
+                cores[q1], cores[q0] = _apply_2q_diff(
+                    _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
         elif isinstance(gate, NonParameterTwoQubitsGate):
             q0, q1 = gate.qubits
-            cores[q0], cores[q1] = _apply_2q_diff(
-                gate.matrix_fun(device=device), cores[q0], cores[q1], dtype
-            )
+            mat = gate.matrix_fun(device=device).to(dtype)
+            _lo, _hi = min(q0, q1), max(q0, q1)
+            is_wrap = (_lo == 0 and _hi == N - 1)
+            if is_wrap:
+                if q0 == N - 1 and q1 == 0:
+                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                else:
+                    cores[N-1], cores[0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+            elif q0 < q1:
+                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+            else:
+                cores[q1], cores[q0] = _apply_2q_diff(
+                    _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
 
     return torch.stack(cores, dim=0)
 
