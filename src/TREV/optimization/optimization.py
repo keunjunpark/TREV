@@ -63,8 +63,9 @@ def minimize(
                     theta, hamiltonian, gradient.measure_method)
             exp_values.append(exp_value)
 
-            # --- build tensor once for best_result ---
-            _tensor = circuit.build_tensor(theta)
+            # --- tensor for best_result: reuse from autograd or build fresh ---
+            _cached_tensor = getattr(gradient, 'last_tensor', None)
+            _tensor = _cached_tensor if _cached_tensor is not None else circuit.build_tensor(theta)
 
             if best_value_method == 'highest_probability':
                 best_result.append(

@@ -295,7 +295,8 @@ class AutogradGradient(Gradient):
         self.term_chunk = term_chunk
         self._verbose = True
         self._printed = False
-        self.last_exp_value = None   # kept for backward compat
+        self.last_exp_value = None   # cached from forward pass
+        self.last_tensor = None      # cached tensor (pre-step)
 
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
         N, chi = circuit.num_qubit, circuit.rank
@@ -313,7 +314,8 @@ class AutogradGradient(Gradient):
             )
             self._printed = True
 
-        grad, exp_val, _ = autograd_gradient(theta, circuit, hamiltonian,
-                                              self.dtype, term_chunk=tc)
+        grad, exp_val, tensor = autograd_gradient(theta, circuit, hamiltonian,
+                                                    self.dtype, term_chunk=tc)
         self.last_exp_value = exp_val
+        self.last_tensor = tensor
         return grad
