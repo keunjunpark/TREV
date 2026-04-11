@@ -102,6 +102,84 @@ def _contraction_diff(tensor, hamiltonian, dtype=torch.complex128):
     return total.real
 
 
+def _auto_term_chunk(N, chi, dtype, device, safety_frac=0.5):
+    """Estimate max Hamiltonian terms to batch given GPU memory.
+
+    Peak memory per term in vectorized contraction with autograd:
+      - Forward: ~3 tensors of chi^4 (ten, r0, r1) per site
+      - Backward graph: stores ~3 intermediates per site for N sites
+      - Total: ~6 * N * chi^4 * element_size per term (conservative)
+
+    Returns term_chunk that fits in free GPU memory.
+    """
+    if not torch.cuda.is_available() or torch.device(device).type != 'cuda':
+        return 64  # CPU fallback
+
+    elem_size = 8 if dtype in (torch.cfloat, torch.complex64) else 16
+    bytes_per_term = 6 * N * (chi ** 4) * elem_size
+
+    free_b, _ = torch.cuda.mem_get_info(device)
+    available = int(free_b * safety_frac)
+
+    chunk = max(1, available // max(1, bytes_per_term))
+    return chunk
+
+
+def _contraction_diff_vectorized(tensor, hamiltonian, dtype=torch.complex128,
+                                 term_chunk=None):
+    """Vectorized contraction: batches Hamiltonian terms in parallel.
+
+    Instead of T sequential contractions, uses batched Kronecker-factored
+    matmuls: (T_chunk, chi, chi, chi, chi) × (chi, chi) at O(T*chi^5)/site.
+
+    Key identity: E_Z = E_I - 2 * (conj(A1)⊗A1), so we compute E_I for
+    all terms, then apply a correction at Z-sites via masking.
+
+    Args:
+        term_chunk: max terms to batch at once. None = all terms.
+    """
+    N = tensor.shape[0]
+    chi = tensor.shape[1]
+    chi2 = chi * chi
+    device = tensor.device
+
+    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N) bool
+    T = paulis.shape[0]
+    coeffs = torch.tensor(hamiltonian.coefficients, dtype=dtype, device=device)
+
+    if term_chunk is None or term_chunk >= T:
+        term_chunk = T
+
+    total = torch.zeros((), dtype=dtype, device=device)
+    eye4 = torch.eye(chi2, dtype=dtype, device=device).reshape(chi, chi, chi, chi)
+
+    for t0 in range(0, T, term_chunk):
+        t1 = min(t0 + term_chunk, T)
+        Tc = t1 - t0
+
+        # Start: ten = I for all Tc terms → (Tc, chi, chi, chi, chi)
+        ten = eye4.unsqueeze(0).expand(Tc, -1, -1, -1, -1).clone()
+
+        for i in range(N):
+            A0 = tensor[i][:, :, 0]  # (chi, chi)
+            A1 = tensor[i][:, :, 1]  # (chi, chi)
+
+            # Kronecker-factored O(chi^5): conj(As)^T @ ten @ As
+            r0 = torch.einsum('bc, taAbB, BC -> taAcC', A0.conj(), ten, A0)
+            r1 = torch.einsum('bc, taAbB, BC -> taAcC', A1.conj(), ten, A1)
+
+            # E_I = r0 + r1,  E_Z = r0 - r1 = E_I - 2*r1
+            ten_I = r0 + r1
+            mask = paulis[t0:t1, i].to(dtype).reshape(Tc, 1, 1, 1, 1)
+            ten = ten_I - 2 * mask * r1
+
+        # Trace for each term
+        traces = torch.einsum('tikik->t', ten)
+        total = total + (coeffs[t0:t1] * traces).sum()
+
+    return total.real
+
+
 def _contraction_real(tensor, hamiltonian):
     """Differentiable contraction in REAL arithmetic (compilable).
 
@@ -164,25 +242,34 @@ def _contraction_real(tensor, hamiltonian):
     return total
 
 
-def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128):
+def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
+                      term_chunk=None):
     """
     Compute gradient via backpropagation through differentiable SVD.
+
+    Uses vectorized contraction that batches Hamiltonian terms in parallel.
 
     Args:
         theta: (P,) parameter tensor
         circuit: Circuit instance
         hamiltonian: Hamiltonian instance
         dtype: complex dtype (complex128 recommended for accuracy)
+        term_chunk: max Hamiltonian terms to batch. None = auto from GPU memory.
 
     Returns:
         (P,) float32 gradient tensor
     """
-    # Must enable grad even if caller uses torch.no_grad() context
     real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
+    N, chi = circuit.num_qubit, circuit.rank
+
+    if term_chunk is None:
+        term_chunk = _auto_term_chunk(N, chi, dtype, circuit.device)
+
     with torch.enable_grad():
         theta_ad = theta.detach().to(real_dtype).clone().requires_grad_(True)
         tensor = _build_tensor_diff(theta_ad, circuit, dtype)
-        loss = _contraction_diff(tensor, hamiltonian, dtype)
+        loss = _contraction_diff_vectorized(tensor, hamiltonian, dtype,
+                                            term_chunk=term_chunk)
         loss.backward()
     return theta_ad.grad.float()
 
@@ -191,27 +278,37 @@ class AutogradGradient(Gradient):
     """
     Gradient computation via PyTorch autograd (backpropagation).
 
-    Uses differentiable SVD with F/G split regularization.
-    Drop-in replacement for BatchParameterShiftGradient.
+    Uses differentiable SVD with F/G split regularization and vectorized
+    contraction that batches Hamiltonian terms in parallel.
 
     Args:
-        dtype: complex dtype for computation (default: complex128 for accuracy)
+        dtype: complex dtype for computation (default: cfloat)
+        term_chunk: max Hamiltonian terms to batch. None = auto from GPU memory.
     """
 
     def __init__(self, measure_method: MeasureMethod = MeasureMethod.EFFICIENT_CONTRACTION,
-                 dtype=torch.cfloat):
+                 dtype=torch.cfloat, term_chunk=None):
         super().__init__(measure_method)
         self.dtype = dtype
+        self.term_chunk = term_chunk
         self._verbose = True
         self._printed = False
 
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
+        N, chi = circuit.num_qubit, circuit.rank
+        tc = self.term_chunk
+        if tc is None:
+            tc = _auto_term_chunk(N, chi, self.dtype, circuit.device)
+
         if self._verbose and not self._printed:
+            T = len(hamiltonian.paulis)
             print(
                 f"[TREV] AutogradGradient: dtype={self.dtype}, "
-                f"params={theta.numel()}, device={circuit.device}\n",
+                f"params={theta.numel()}, device={circuit.device}, "
+                f"term_chunk={min(tc, T)}/{T}\n",
                 flush=True,
             )
             self._printed = True
 
-        return autograd_gradient(theta, circuit, hamiltonian, self.dtype)
+        return autograd_gradient(theta, circuit, hamiltonian, self.dtype,
+                                 term_chunk=tc)
