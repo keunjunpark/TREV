@@ -2,12 +2,16 @@ from typing import List
 
 import torch
 
-from ..gates.info import Z, I
+from ..gates.info import Z, I, X, Y
 
 OPS = {
     'I': I(None),
+    'X': X(None),
+    'Y': Y(None),
     'Z': Z(None),
 }
+
+_PAULI_TO_OP = {'I': 0, 'X': 1, 'Y': 2, 'Z': 3}
 
 class Hamiltonian():
     def __init__(self, num_qubits:int, paulis:List[str]= None, coefficients:List[complex]=None):
@@ -30,6 +34,18 @@ class Hamiltonian():
         dtype=torch.bool)
         else:
             raise NotImplementedError()
+
+    def get_pauli_op_tensor(self):
+        """Returns (T, N) uint8 tensor: 0=I, 1=X, 2=Y, 3=Z."""
+        return torch.tensor(
+            [[_PAULI_TO_OP[p[i]] for i in range(self.num_qubits)] for p in self.paulis],
+            dtype=torch.uint8,
+        )
+
+    @property
+    def has_only_zi(self):
+        """True if Hamiltonian only uses Z and I operators."""
+        return all(c in 'IZ' for p in self.paulis for c in p)
 
     def pauli_string_to_matrix_torch(self,pauli: str) -> torch.Tensor:
         result = OPS[pauli[0]]

@@ -106,9 +106,9 @@ def _auto_term_chunk(N, chi, dtype, device, safety_frac=0.5):
     """Estimate max Hamiltonian terms to batch given GPU memory.
 
     Peak memory per term in vectorized contraction with autograd:
-      - Forward: ~3 tensors of chi^4 (ten, r0, r1) per site
-      - Backward graph: stores ~3 intermediates per site for N sites
-      - Total: ~6 * N * chi^4 * element_size per term (conservative)
+      - Forward: ~5 tensors of chi^4 (ten, r00, r11, r01, r10) per site
+      - Backward graph: stores ~5 intermediates per site for N sites
+      - Total: ~10 * N * chi^4 * element_size per term (conservative)
 
     Returns term_chunk that fits in free GPU memory.
     """
@@ -116,7 +116,7 @@ def _auto_term_chunk(N, chi, dtype, device, safety_frac=0.5):
         return 64  # CPU fallback
 
     elem_size = 8 if dtype in (torch.cfloat, torch.complex64) else 16
-    bytes_per_term = 6 * N * (chi ** 4) * elem_size
+    bytes_per_term = 10 * N * (chi ** 4) * elem_size
 
     free_b, _ = torch.cuda.mem_get_info(device)
     available = int(free_b * safety_frac)
@@ -129,11 +129,14 @@ def _contraction_diff_vectorized(tensor, hamiltonian, dtype=torch.complex128,
                                  term_chunk=None):
     """Vectorized contraction: batches Hamiltonian terms in parallel.
 
-    Instead of T sequential contractions, uses batched Kronecker-factored
-    matmuls: (T_chunk, chi, chi, chi, chi) × (chi, chi) at O(T*chi^5)/site.
+    Supports all 4 Pauli operators (I, X, Y, Z) for chemistry Hamiltonians.
+    Uses batched Kronecker-factored einsums at O(T*chi^5) per site.
 
-    Key identity: E_Z = E_I - 2 * (conj(A1)⊗A1), so we compute E_I for
-    all terms, then apply a correction at Z-sites via masking.
+    Transfer matrices per operator:
+      I: conj(A0)⊗A0 + conj(A1)⊗A1       = r00 + r11
+      X: conj(A0)⊗A1 + conj(A1)⊗A0       = r01 + r10
+      Y: -i·conj(A0)⊗A1 + i·conj(A1)⊗A0  = 1j*(r10 - r01)
+      Z: conj(A0)⊗A0 - conj(A1)⊗A1       = r00 - r11
 
     Args:
         term_chunk: max terms to batch at once. None = all terms.
@@ -143,9 +146,10 @@ def _contraction_diff_vectorized(tensor, hamiltonian, dtype=torch.complex128,
     chi2 = chi * chi
     device = tensor.device
 
-    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N) bool
-    T = paulis.shape[0]
+    op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8: 0=I,1=X,2=Y,3=Z
+    T = op_tensor.shape[0]
     coeffs = torch.tensor(hamiltonian.coefficients, dtype=dtype, device=device)
+    has_xy = hamiltonian.has_only_zi is False if hasattr(hamiltonian, 'has_only_zi') else (op_tensor == 1).any() or (op_tensor == 2).any()
 
     if term_chunk is None or term_chunk >= T:
         term_chunk = T
@@ -156,24 +160,43 @@ def _contraction_diff_vectorized(tensor, hamiltonian, dtype=torch.complex128,
     for t0 in range(0, T, term_chunk):
         t1 = min(t0 + term_chunk, T)
         Tc = t1 - t0
+        ops_chunk = op_tensor[t0:t1]  # (Tc, N)
 
-        # Start: ten = I for all Tc terms → (Tc, chi, chi, chi, chi)
         ten = eye4.unsqueeze(0).expand(Tc, -1, -1, -1, -1).clone()
 
         for i in range(N):
             A0 = tensor[i][:, :, 0]  # (chi, chi)
             A1 = tensor[i][:, :, 1]  # (chi, chi)
 
-            # Kronecker-factored O(chi^5): conj(As)^T @ ten @ As
-            r0 = torch.einsum('bc, taAbB, BC -> taAcC', A0.conj(), ten, A0)
-            r1 = torch.einsum('bc, taAbB, BC -> taAcC', A1.conj(), ten, A1)
+            # Kronecker products: conj(Aa) ⊗ Ab via einsum
+            r00 = torch.einsum('bc, taAbB, BC -> taAcC', A0.conj(), ten, A0)
+            r11 = torch.einsum('bc, taAbB, BC -> taAcC', A1.conj(), ten, A1)
 
-            # E_I = r0 + r1,  E_Z = r0 - r1 = E_I - 2*r1
-            ten_I = r0 + r1
-            mask = paulis[t0:t1, i].to(dtype).reshape(Tc, 1, 1, 1, 1)
-            ten = ten_I - 2 * mask * r1
+            if has_xy:
+                r01 = torch.einsum('bc, taAbB, BC -> taAcC', A0.conj(), ten, A1)
+                r10 = torch.einsum('bc, taAbB, BC -> taAcC', A1.conj(), ten, A0)
 
-        # Trace for each term
+            # Build per-term result using operator masks
+            ops_i = ops_chunk[:, i]  # (Tc,) uint8
+
+            if not has_xy:
+                # Fast path: Z/I only (MaxCut, TFIM, etc.)
+                mask_z = (ops_i == 3).to(dtype).reshape(Tc, 1, 1, 1, 1)
+                ten = (r00 + r11) - 2 * mask_z * r11
+            else:
+                # General path: all 4 Pauli operators
+                # E = c00*r00 + c11*r11 + c01*r01 + c10*r10
+                # I: 1,1,0,0  X: 0,0,1,1  Y: 0,0,-j,j  Z: 1,-1,0,0
+                m_i = (ops_i == 0).to(dtype).reshape(Tc, 1, 1, 1, 1)
+                m_x = (ops_i == 1).to(dtype).reshape(Tc, 1, 1, 1, 1)
+                m_y = (ops_i == 2).to(dtype).reshape(Tc, 1, 1, 1, 1)
+                m_z = (ops_i == 3).to(dtype).reshape(Tc, 1, 1, 1, 1)
+
+                ten = ((m_i + m_z) * r00 +
+                       (m_i - m_z) * r11 +
+                       (m_x - 1j * m_y) * r01 +
+                       (m_x + 1j * m_y) * r10)
+
         traces = torch.einsum('tikik->t', ten)
         total = total + (coeffs[t0:t1] * traces).sum()
 
