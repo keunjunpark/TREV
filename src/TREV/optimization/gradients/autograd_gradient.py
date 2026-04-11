@@ -362,6 +362,10 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
     if term_chunk is None:
         term_chunk = _auto_term_chunk(N, chi, dtype, circuit.device)
 
+    # Apply qubit permutation from transpiled circuits (same as circuit.get_expectation_value)
+    if circuit.qubit_perm is not None:
+        hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
+
     with torch.enable_grad():
         theta_ad = theta.detach().to(real_dtype).clone().requires_grad_(True)
         tensor = _build_tensor_diff(theta_ad, circuit, dtype)
