@@ -371,3 +371,43 @@ def from_qiskit(
 
     theta = torch.tensor(param_values, dtype=torch.float32) if all_numeric else None
     return out, theta
+
+
+def build_parameter_mapping(
+    qc,
+    fuse_zz_swap: bool = False,
+    rank: int = 10,
+    device: str = 'cpu',
+):
+    """Build linear mapping from Qiskit logical params to TREV theta.
+
+    The parameter mapping is linear::
+
+        full_theta = param_base + jacobian @ logical_params
+
+    Returns
+    -------
+    (circuit, param_base, jacobian, param_names)
+    """
+    params = sorted(qc.parameters, key=lambda p: p.name)
+    param_names = [p.name for p in params]
+    K = len(params)
+
+    zero_bind = {p: 0.0 for p in params}
+    qc_zero = qc.assign_parameters(zero_bind)
+    circuit, param_base = from_qiskit(
+        qc_zero, fuse_zz_swap=fuse_zz_swap, rank=rank, device=device,
+    )
+    P = param_base.shape[0]
+
+    jacobian = torch.zeros(P, K, dtype=param_base.dtype)
+    for i, param in enumerate(params):
+        unit_bind = {p: 0.0 for p in params}
+        unit_bind[param] = 1.0
+        qc_unit = qc.assign_parameters(unit_bind)
+        _, theta_unit = from_qiskit(
+            qc_unit, fuse_zz_swap=fuse_zz_swap, rank=rank, device=device,
+        )
+        jacobian[:, i] = (theta_unit - param_base).cpu()
+
+    return circuit, param_base.cpu(), jacobian, param_names
