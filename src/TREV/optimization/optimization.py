@@ -54,38 +54,43 @@ def minimize(
 
             # --- expectation value ---
             # Reuse cached value from autograd forward pass if available
-            if hasattr(gradient, 'last_exp_value') and gradient.last_exp_value is not None:
-                exp_value = gradient.last_exp_value
+            # (pre-step value, standard in training loops)
+            cached_ev = getattr(gradient, 'last_exp_value', None)
+            if cached_ev is not None:
+                exp_value = cached_ev
             else:
-                exp_value = circuit.get_expectation_value(theta, hamiltonian, gradient.measure_method)
+                exp_value = circuit.get_expectation_value(
+                    theta, hamiltonian, gradient.measure_method)
             exp_values.append(exp_value)
 
-            # --- best result method ---
+            # --- build tensor once for best_result ---
+            _tensor = circuit.build_tensor(theta)
+
             if best_value_method == 'highest_probability':
                 best_result.append(
-                    get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
+                    get_value_of_highest_probability(_tensor, circuit.device)
                 )
             elif best_value_method == 'argmax_tr_noinv_BE':
                 best_result.append(
-                    argmax_bitstring_tr_right_suffix(circuit.build_tensor(theta))
+                    argmax_bitstring_tr_right_suffix(_tensor)
                 )
             elif best_value_method == 'full_contraction':
-                best_idx = contract_tensor_ring(circuit.build_tensor(theta)).abs().pow(2).argmax().item()
+                best_idx = contract_tensor_ring(_tensor).abs().pow(2).argmax().item()
                 num_qubits = circuit.num_qubit
                 best_bitstring = format(best_idx, f'0{num_qubits}b')
                 best_result.append(best_bitstring[::-1])
             else:
                 if gradient.measure_method in [MeasureMethod.PERFECT_SAMPLING]:
                     best_result.append(
-                        get_value_of_highest_probability(circuit.build_tensor(theta), circuit.device)
+                        get_value_of_highest_probability(_tensor, circuit.device)
                     )
                 elif gradient.measure_method in [MeasureMethod.FULL_CONTRACTION, MeasureMethod.EFFICIENT_CONTRACTION]:
                     best_result.append(
-                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(_tensor, circuit.device)
                     )
                 elif gradient.measure_method in [MeasureMethod.RIGHT_SUFFIX_SAMPLING]:
                     best_result.append(
-                        argmax_tr_noinv_BE(circuit.build_tensor(theta), circuit.device)
+                        argmax_tr_noinv_BE(_tensor, circuit.device)
                     )
                 else:
                     raise NotImplementedError()

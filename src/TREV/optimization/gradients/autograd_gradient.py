@@ -271,8 +271,9 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
         loss = _contraction_diff_vectorized(tensor, hamiltonian, dtype,
                                             term_chunk=term_chunk)
         loss_val = loss.detach().float().item()
+        tensor_detached = tensor.detach()
         loss.backward()
-    return theta_ad.grad.float(), loss_val
+    return theta_ad.grad.float(), loss_val, tensor_detached
 
 
 class AutogradGradient(Gradient):
@@ -294,7 +295,7 @@ class AutogradGradient(Gradient):
         self.term_chunk = term_chunk
         self._verbose = True
         self._printed = False
-        self.last_exp_value = None  # cached from forward pass
+        self.last_exp_value = None   # kept for backward compat
 
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
         N, chi = circuit.num_qubit, circuit.rank
@@ -312,7 +313,7 @@ class AutogradGradient(Gradient):
             )
             self._printed = True
 
-        grad, exp_val = autograd_gradient(theta, circuit, hamiltonian, self.dtype,
-                                          term_chunk=tc)
+        grad, exp_val, _ = autograd_gradient(theta, circuit, hamiltonian,
+                                              self.dtype, term_chunk=tc)
         self.last_exp_value = exp_val
         return grad
