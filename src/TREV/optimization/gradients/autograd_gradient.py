@@ -48,12 +48,20 @@ def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
 
     Uses native-dtype gate matrix computation to avoid precision loss
     from info.py's forced .type(torch.cfloat) cast.
+
+    Adds deterministic noise (1e-8) to initial cores to break singular
+    value degeneracy. Without this, rank-1 initialization creates
+    degenerate zero SVs that cause gradient explosion in the SVD backward.
     """
     N, chi = circuit.num_qubit, circuit.rank
     device = circuit.device
+    gen = torch.Generator(device=device)
+    gen.manual_seed(N * 1000 + chi)
     cores = [torch.zeros(chi, chi, 2, dtype=dtype, device=device) for _ in range(N)]
     for i in range(N):
         cores[i][0, 0, 0] = 1.0
+        noise = torch.randn(chi, chi, 2, generator=gen, device=device, dtype=torch.float32)
+        cores[i] = cores[i] + 1e-8 * noise.to(dtype)
 
     for gate in circuit.gates:
         if isinstance(gate, ParameterOneQubitGate):
