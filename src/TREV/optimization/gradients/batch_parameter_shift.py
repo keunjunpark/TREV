@@ -616,15 +616,11 @@ def expectation_value_batch_efficient_contraction(
     use_complex64: bool = True,          # internal complex precision
 ) -> Tensor:
     """
-    Exact batched <psi|H|psi> via identity-chain factored Kronecker contraction.
+    Exact batched <psi|H|psi> via 2D transfer-matrix contraction.
 
-    Precomputes all-identity left-prefix and right-suffix products, then
-    contracts only at the sparse Z-sites of each Hamiltonian term.
-
-    Complexity: O((N + k*T) * B * chi^5)  instead of  O(N * T * B * chi^5)
-    Memory:     O(N * B * chi^4)  instead of  O(T * B * chi^4)
-
-    where k is the average number of Z-operators per Hamiltonian term.
+    Uses (B, chi^2, chi^2) representation with torch.bmm for maximum GPU
+    throughput.  Batches all Hamiltonian terms into stacked bmm calls to
+    minimise kernel launches (critical on A100-class GPUs).
     """
     device = getattr(circuit, "device", param_batch.device)
 
@@ -634,14 +630,33 @@ def expectation_value_batch_efficient_contraction(
     else:
         batch_slices = [(s, min(s + param_chunk, B_total)) for s in range(0, B_total, param_chunk)]
 
-    # Hamiltonian
-    op_tensor = hamiltonian.get_pauli_op_tensor().to(device)  # (T, N) uint8
-    coeffs = torch.as_tensor(
-        hamiltonian.coefficients,
-        dtype=torch.cfloat if use_complex64 else torch.cdouble,
-        device=device,
-    )
-    T, N = op_tensor.shape
+    # Hamiltonian — move to CPU numpy once (no GPU syncs in classification)
+    op_tensor = hamiltonian.get_pauli_op_tensor()  # (T, N) uint8, CPU is fine
+    op_np = op_tensor.numpy() if op_tensor.device.type == 'cpu' else op_tensor.cpu().numpy()
+    coeffs_list = hamiltonian.coefficients  # python list
+    T, N = op_np.shape
+
+    ctype = torch.complex64 if use_complex64 else torch.complex128
+
+    # Pre-classify terms on CPU (zero GPU interaction)
+    from collections import defaultdict
+    single_site_coeffs = defaultdict(complex)
+    multi_groups = defaultdict(complex)
+    all_identity_coeff = 0.0 + 0j
+
+    for t in range(T):
+        ops_t = op_np[t]
+        non_i = ops_t.nonzero()[0]
+        c = complex(coeffs_list[t])
+        if len(non_i) == 0:
+            all_identity_coeff += c
+        elif len(non_i) == 1:
+            s = int(non_i[0])
+            single_site_coeffs[(s, int(ops_t[s]))] += c
+        else:
+            s_first, s_last = int(non_i[0]), int(non_i[-1])
+            span_ops = tuple(int(ops_t[i]) for i in range(s_first, s_last + 1))
+            multi_groups[(s_first, s_last, span_ops)] += c
 
     out_parts = []
 
@@ -653,101 +668,139 @@ def expectation_value_batch_efficient_contraction(
         ring = circuit.build_tensor_batch(param_view, B).to(device)  # (B,N,l,r,2)
         _, N_check, l, r, d = ring.shape
         assert N_check == N and d == 2, "MPS/circuit shape mismatch with Hamiltonian"
-        ctype = torch.complex64 if use_complex64 else torch.complex128
         chi = l
+        chi2 = chi * chi
 
-        # Cache per-site A0/A1 slices
-        sites = []
+        # Per-site A0/A1: (B, chi, chi)
+        A0_all = []  # list of N tensors, each (B, chi, chi)
+        A1_all = []
         for i in range(N):
             Ab = ring[:, i].to(ctype)
-            sites.append((Ab[:, :, :, 0].contiguous(), Ab[:, :, :, 1].contiguous()))
+            A0_all.append(Ab[:, :, :, 0].contiguous())
+            A1_all.append(Ab[:, :, :, 1].contiguous())
         del ring
 
-        eye4 = _make_eye4(B, chi, ctype, device)
+        # --- Build 2D transfer matrices E[s][op]: (B, chi^2, chi^2) ---
+        # E_op = kron(conj(Abra), Aket) + kron(conj(Abra'), Aket')
+        # kron(X, Y)[b, (i*chi+j), (k*chi+l)] = X[b,i,k] * Y[b,j,l]
+        def _build_kron(X, Y):
+            # X, Y: (B, chi, chi) -> kron: (B, chi^2, chi^2)
+            return torch.einsum('bik,bjl->bijkl', X, Y).reshape(B, chi2, chi2)
 
-        # --- Precompute left prefix products under all-identity ---
-        # L_pre[i] = E_I(0) @ E_I(1) @ ... @ E_I(i-1),  L_pre[0] = I
-        # Uses right contraction: acc = acc @ E_I(i)
+        E_I_list = []  # E_I[s]: (B, chi^2, chi^2)
+        E_op_cache = {}  # (s, op) -> (B, chi^2, chi^2)
+        for s in range(N):
+            A0, A1 = A0_all[s], A1_all[s]
+            E_I_s = _build_kron(A0.conj(), A0) + _build_kron(A1.conj(), A1)
+            E_I_list.append(E_I_s)
+
+        # Build operator transfer matrices only for ops that appear
+        needed_ops = set()
+        for (s, op) in single_site_coeffs:
+            needed_ops.add((s, op))
+        for (s_first, s_last, span_ops) in multi_groups:
+            for idx, i in enumerate(range(s_first, s_last + 1)):
+                op = span_ops[idx]
+                if op != 0:
+                    needed_ops.add((i, op))
+
+        for (s, op) in needed_ops:
+            A0, A1 = A0_all[s], A1_all[s]
+            if op == 3:  # Z
+                E_op_cache[(s, op)] = _build_kron(A0.conj(), A0) - _build_kron(A1.conj(), A1)
+            elif op == 1:  # X
+                E_op_cache[(s, op)] = _build_kron(A0.conj(), A1) + _build_kron(A1.conj(), A0)
+            elif op == 2:  # Y
+                E_op_cache[(s, op)] = -1j * _build_kron(A0.conj(), A1) + 1j * _build_kron(A1.conj(), A0)
+
+        del A0_all, A1_all
+
+        # --- Precompute L_pre (left prefix) and R_suf (right suffix) in 2D ---
+        eye2d = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1)
+
         L_pre = [None] * (N + 1)
-        acc = eye4
+        L_pre[0] = eye2d
         for i in range(N):
-            L_pre[i] = acc
-            A0_i, A1_i = sites[i]
-            acc = _kron_contract_right(acc, A0_i, A1_i)
-        L_pre[N] = acc
-        del acc
+            L_pre[i + 1] = torch.bmm(L_pre[i], E_I_list[i])
 
-        # --- Precompute TRANSPOSED right suffix products under all-identity ---
-        # R_suf_T[i] = (E_I(i) @ ... @ E_I(N-1))^T = E_I(N-1)^T @ ... @ E_I(i)^T
-        # R_suf_T[N] = I
-        # Since E_I^T uses A^T instead of A, we pass A.mT to the right-contraction.
-        # Trace formula: Tr(run @ R_suf[i]) = (run * R_suf_T[i]).sum(dims 1..4)
-        R_suf_T = [None] * (N + 1)
-        acc = eye4
+        R_suf = [None] * (N + 1)
+        R_suf[N] = eye2d
         for i in range(N - 1, -1, -1):
-            A0_i, A1_i = sites[i]
-            acc = _kron_contract_right(acc, A0_i.mT, A1_i.mT)
-            R_suf_T[i] = acc
-        R_suf_T[N] = eye4
-        del acc, eye4
+            R_suf[i] = torch.bmm(E_I_list[i], R_suf[i + 1])
 
-        # --- Per-term contraction: only at non-identity sites ---
+        # --- Compute all traces ---
         totals = torch.zeros(B, dtype=ctype, device=device)
 
-        # Move op_tensor to CPU numpy ONCE to avoid per-term GPU-CPU syncs.
-        op_np = op_tensor.cpu().numpy()  # (T, N)
+        # All-identity
+        if all_identity_coeff != 0:
+            # Tr(L_pre[N]) = Tr(full ring product)
+            tr = L_pre[N].diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # (B,)
+            totals += all_identity_coeff * tr
 
-        # Pre-classify all terms on CPU (no GPU syncs in this loop).
-        from collections import defaultdict
-        single_site_coeffs = defaultdict(float)  # (site, op) -> summed coeff (python float)
-        multi_site_terms = []  # list of (t, non_i_sites_list, ops_list)
-        all_identity_coeff = 0.0
+        # Single-site terms: batch into one stacked bmm
+        if single_site_coeffs:
+            ss_keys = list(single_site_coeffs.keys())
+            ss_coeffs = torch.tensor(
+                [single_site_coeffs[k] for k in ss_keys], dtype=ctype, device=device
+            )  # (S,)
+            S = len(ss_keys)
+            # Stack L_pre[s] @ E_op[s] for all groups, then trace with R_suf[s+1]
+            # L: (S, B, chi^2, chi^2),  E: (S, B, chi^2, chi^2),  R: (S, B, chi^2, chi^2)
+            L_stack = torch.stack([L_pre[s] for s, _ in ss_keys])        # (S, B, c2, c2)
+            E_stack = torch.stack([E_op_cache[(s, op)] for s, op in ss_keys])
+            R_stack = torch.stack([R_suf[s + 1] for s, _ in ss_keys])
 
-        for t in range(T):
-            ops_t = op_np[t]
-            non_i = ops_t.nonzero()[0]
-            c = coeffs[t].item()
-            if len(non_i) == 0:
-                all_identity_coeff += c
-            elif len(non_i) == 1:
-                s = int(non_i[0])
-                single_site_coeffs[(s, int(ops_t[s]))] += c
-            else:
-                # Store precomputed per-site ops for the span
-                s_first, s_last = int(non_i[0]), int(non_i[-1])
-                span_ops = [int(ops_t[i]) for i in range(s_first, s_last + 1)]
-                multi_site_terms.append((t, s_first, s_last, span_ops))
+            # Reshape to (S*B, c2, c2) for one bmm call
+            SB = S * B
+            LE = torch.bmm(L_stack.reshape(SB, chi2, chi2),
+                           E_stack.reshape(SB, chi2, chi2))  # (S*B, c2, c2)
+            # Trace of LE @ R = sum of (LE * R^T) elementwise, or diagonal of LE @ R
+            # Fastest: (LE * R^T).sum(dim=(-2,-1))
+            R_flat = R_stack.reshape(SB, chi2, chi2)
+            traces = (LE * R_flat.transpose(-2, -1)).sum(dim=(-2, -1))  # (S*B,)
+            traces = traces.reshape(S, B)  # (S, B)
+            totals += (ss_coeffs.unsqueeze(-1) * traces).sum(dim=0)  # (B,)
 
-        # All-identity terms
-        if all_identity_coeff != 0.0:
-            totals += all_identity_coeff * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
+        # Multi-site terms
+        if multi_groups:
+            ms_keys = list(multi_groups.keys())
+            ms_coeffs = torch.tensor(
+                [multi_groups[k] for k in ms_keys], dtype=ctype, device=device
+            )  # (G,)
+            G = len(ms_keys)
 
-        # Batched single-site terms: one contraction per (site, op) group
-        for (s, op), coeff_sum in single_site_coeffs.items():
-            A0_s, A1_s = sites[s]
-            run = _kron_contract_right(L_pre[s], A0_s, A1_s, op=op)
-            totals += coeff_sum * (run * R_suf_T[s + 1]).sum(dim=(1, 2, 3, 4))
+            # For each group, compute the span product E(s_first) @ E(s_first+1) @ ... @ E(s_last)
+            # then trace L_pre[s_first] @ span_prod @ R_suf[s_last+1]
+            span_prods = []
+            L_ms = []
+            R_ms = []
+            for (s_first, s_last, span_ops) in ms_keys:
+                prod = torch.eye(chi2, dtype=ctype, device=device).unsqueeze(0).expand(B, -1, -1).clone()
+                for idx, i in enumerate(range(s_first, s_last + 1)):
+                    op = span_ops[idx]
+                    E = E_op_cache[(i, op)] if op != 0 else E_I_list[i]
+                    prod = torch.bmm(prod, E)
+                span_prods.append(prod)
+                L_ms.append(L_pre[s_first])
+                R_ms.append(R_suf[s_last + 1])
 
-        # Multi-site terms: group by (s_first, s_last, ops_pattern) to deduplicate
-        multi_groups = defaultdict(float)  # (s_first, s_last, tuple(ops)) -> summed coeff
-        for t, s_first, s_last, span_ops in multi_site_terms:
-            key = (s_first, s_last, tuple(span_ops))
-            multi_groups[key] += coeffs[t].item()
+            L_ms_stack = torch.stack(L_ms)         # (G, B, c2, c2)
+            S_ms_stack = torch.stack(span_prods)    # (G, B, c2, c2)
+            R_ms_stack = torch.stack(R_ms)          # (G, B, c2, c2)
 
-        for (s_first, s_last, span_ops), coeff_sum in multi_groups.items():
-            run = L_pre[s_first]
-            for idx, i in enumerate(range(s_first, s_last + 1)):
-                run = _kron_contract_right(run, sites[i][0], sites[i][1], op=span_ops[idx])
-            totals += coeff_sum * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
+            GB = G * B
+            LS = torch.bmm(L_ms_stack.reshape(GB, chi2, chi2),
+                           S_ms_stack.reshape(GB, chi2, chi2))  # (G*B, c2, c2)
+            R_flat = R_ms_stack.reshape(GB, chi2, chi2)
+            traces = (LS * R_flat.transpose(-2, -1)).sum(dim=(-2, -1)).reshape(G, B)
+            totals += (ms_coeffs.unsqueeze(-1) * traces).sum(dim=0)
 
         # Normalize: <psi|H|psi> / <psi|psi>
-        # For deep circuits, SVD truncation causes <psi|psi> to shrink exponentially.
-        # L_pre[N] is the all-identity product; its trace gives <psi|psi>.
-        norm_sq = (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4)).real
-        norm_sq = norm_sq.clamp_min(1e-30)  # guard against division by zero
+        norm_sq = L_pre[N].diagonal(dim1=-2, dim2=-1).sum(dim=-1).real
+        norm_sq = norm_sq.clamp_min(1e-30)
         out_parts.append((totals.real / norm_sq).float())
 
-        del sites, L_pre, R_suf_T, totals
+        del E_I_list, E_op_cache, L_pre, R_suf, totals
 
     return torch.cat(out_parts, dim=0)
 
