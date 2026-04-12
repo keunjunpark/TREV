@@ -564,41 +564,29 @@ def _kron_contract_right(Prod, A0, A1, op=0):
     op=1 (X): E = conj(A0)⊗A1 + conj(A1)⊗A0
     op=2 (Y): E = -i·conj(A0)⊗A1 + i·conj(A1)⊗A0
 
-    Prod: (B, ..., l_bra, l_ket, r_bra, r_ket)  -- last 4 dims are spatial
+    Prod: (B, chi, chi, chi, chi)  -- 4D spatial dims
     A0, A1: (B, chi, chi)
 
-    Contracts r_bra/r_ket (last 2 dims of Prod) and produces new right indices.
-    A must broadcast over all dims between B and r_bra/r_ket (i.e., middle + l_bra + l_ket).
+    Uses fused einsum: result[b,i,j,m,n] = sum_{k,l} Prod[b,i,j,k,l] * conj(Abra[b,k,m]) * Aket[b,l,n]
     """
-    # Number of dims to broadcast over: everything between B (dim 0) and r_bra/r_ket (last 2)
-    n_broadcast = Prod.dim() - 3  # = n_middle + l_bra + l_ket
-    slices = (slice(None),) + (None,) * n_broadcast + (slice(None), slice(None))
-    A0H_e = A0.conj().mT[slices]
-    A1H_e = A1.conj().mT[slices]
+    A0c = A0.conj()
+    A1c = A1.conj()
 
-    if op == 0:  # I: conj(A0)⊗A0 + conj(A1)⊗A1
-        A0_e = A0[slices]
-        A1_e = A1[slices]
-        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
-        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+    if op == 0:  # I
+        r0 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A0c, A0)
+        r1 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A1c, A1)
         return r0 + r1
-    elif op == 3:  # Z: conj(A0)⊗A0 - conj(A1)⊗A1
-        A0_e = A0[slices]
-        A1_e = A1[slices]
-        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A0_e))
-        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A1_e))
+    elif op == 3:  # Z
+        r0 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A0c, A0)
+        r1 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A1c, A1)
         return r0 - r1
-    elif op == 1:  # X: conj(A0)⊗A1 + conj(A1)⊗A0
-        A0_e = A0[slices]
-        A1_e = A1[slices]
-        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A1_e))
-        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A0_e))
+    elif op == 1:  # X
+        r0 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A0c, A1)
+        r1 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A1c, A0)
         return r0 + r1
-    else:  # op == 2, Y: -i·conj(A0)⊗A1 + i·conj(A1)⊗A0
-        A0_e = A0[slices]
-        A1_e = A1[slices]
-        r0 = torch.matmul(A0H_e, torch.matmul(Prod, A1_e))
-        r1 = torch.matmul(A1H_e, torch.matmul(Prod, A0_e))
+    else:  # Y
+        r0 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A0c, A1)
+        r1 = torch.einsum('bijkl,bkm,bln->bijmn', Prod, A1c, A0)
         return -1j * r0 + 1j * r1
 
 
@@ -702,27 +690,46 @@ def expectation_value_batch_efficient_contraction(
         # --- Per-term contraction: only at non-identity sites ---
         totals = torch.zeros(B, dtype=ctype, device=device)
 
+        # Group single-site terms by (site, op) to batch them.
+        # Key: (site, op) -> summed coefficient
+        from collections import defaultdict
+        single_site_groups = defaultdict(lambda: torch.zeros(1, dtype=ctype, device=device))
+        multi_site_terms = []
+        all_identity_coeff = torch.zeros(1, dtype=ctype, device=device)
+
         for t in range(T):
             non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()
-
             if len(non_i_sites) == 0:
-                # All identity: Tr(full ring) = (L_pre[N] * R_suf_T[N]).sum
-                totals += coeffs[t] * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
-                continue
+                all_identity_coeff += coeffs[t]
+            elif len(non_i_sites) == 1:
+                s = non_i_sites[0]
+                op = op_tensor[t, s].item()
+                single_site_groups[(s, op)] += coeffs[t]
+            else:
+                multi_site_terms.append(t)
 
+        # All-identity terms
+        if all_identity_coeff.item() != 0:
+            totals += all_identity_coeff * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
+
+        # Batched single-site terms: one contraction per (site, op) group
+        for (s, op), coeff_sum in single_site_groups.items():
+            A0_s, A1_s = sites[s]
+            run = _kron_contract_right(L_pre[s], A0_s, A1_s, op=op)
+            totals += coeff_sum * (run * R_suf_T[s + 1]).sum(dim=(1, 2, 3, 4))
+
+        # Multi-site terms: process individually (no clone needed)
+        for t in multi_site_terms:
+            non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()
             s_first = non_i_sites[0]
             s_last = non_i_sites[-1]
 
-            # Start from the precomputed left prefix up to the first non-I site
-            run = L_pre[s_first].clone()
-
-            # Contract through sites s_first..s_last
+            run = L_pre[s_first]
             for i in range(s_first, s_last + 1):
                 A0_i, A1_i = sites[i]
                 op_i = op_tensor[t, i].item()
                 run = _kron_contract_right(run, A0_i, A1_i, op=op_i)
 
-            # Tr(run @ R_suf[s_last+1]) = element-wise product with transposed suffix
             totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
 
         # Normalize: <psi|H|psi> / <psi|psi>
