@@ -41,6 +41,16 @@ class TruncatedSVD(torch.autograd.Function):
     def backward(ctx, dU, dS, dVh):
         U_full, S_full, Vh_full = ctx.saved_tensors
         m, n = ctx.shape
+
+        # Upcast to float64 for backward stability (forward stays in original dtype)
+        orig_dtype = U_full.dtype
+        if U_full.dtype == torch.cfloat:
+            U_full = U_full.to(torch.complex128)
+            S_full = S_full.to(torch.float64)
+            Vh_full = Vh_full.to(torch.complex128)
+            dU = dU.to(torch.complex128)
+            dS = dS.to(torch.float64)
+            dVh = dVh.to(torch.complex128)
         k = ctx.k
         r = S_full.shape[0]  # min(m, n)
         is_complex = U_full.is_complex()
@@ -101,7 +111,9 @@ class TruncatedSVD(torch.autograd.Function):
             L_corr = torch.zeros_like(L_diag)
             L_corr.imag = L_diag.imag * S_inv.real
             dA = dA + (U * L_corr.unsqueeze(-2)) @ Vh
-        return dA, None
+
+        # Downcast back to original dtype
+        return dA.to(orig_dtype), None
 
 
 def diff_svd(A, k):
