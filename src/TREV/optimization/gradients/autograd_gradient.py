@@ -59,7 +59,12 @@ def _swap_route_apply(cores, q0, q1, gate_mat, dtype, N):
 
 
 def _apply_2q_diff(gate_matrix, qu0, qu1, dtype):
-    """Apply 2-qubit gate with differentiable SVD split."""
+    """Apply 2-qubit gate with differentiable SVD split.
+
+    Uses diff_svd in cfloat (matching build_tensor's precision) to
+    ensure the forward tensor matches exactly. The custom SVD backward
+    handles complex phase correction that PyTorch's native SVD cannot.
+    """
     chi1, chi3 = qu0.shape[0], qu1.shape[1]
     mps = torch.tensordot(qu0, qu1, ([1], [0]))
     mps = torch.moveaxis(mps, 2, 1)
@@ -75,74 +80,71 @@ def _apply_2q_diff(gate_matrix, qu0, qu1, dtype):
 def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
     """Build tensor ring with autograd tracking (no in-place ops).
 
-    Uses native-dtype gate matrix computation to avoid precision loss
-    from info.py's forced .type(torch.cfloat) cast.
-
-    Adds deterministic noise (1e-8) to initial cores to break singular
-    value degeneracy. Without this, rank-1 initialization creates
-    degenerate zero SVs that cause gradient explosion in the SVD backward.
+    Uses cfloat for gate application and SVD (matching build_tensor exactly),
+    then upcasts to dtype for the contraction backward pass.
     """
     N, chi = circuit.num_qubit, circuit.rank
     device = circuit.device
-    gen = torch.Generator(device=device)
-    gen.manual_seed(N * 1000 + chi)
-    cores = [torch.zeros(chi, chi, 2, dtype=dtype, device=device) for _ in range(N)]
+    # Build in cfloat to match build_tensor's precision and SVD behavior
+    build_dtype = torch.cfloat
+    cores = [torch.zeros(chi, chi, 2, dtype=build_dtype, device=device) for _ in range(N)]
     for i in range(N):
         cores[i][0, 0, 0] = 1.0
-        noise = torch.randn(chi, chi, 2, generator=gen, device=device, dtype=torch.float32)
-        cores[i] = cores[i] + 1e-4 * noise.to(dtype)
 
+    bd = build_dtype  # shorthand
     for gate in circuit.gates:
         if isinstance(gate, ParameterMultiOneQubitGate):
             params = torch.stack([theta[i] for i in gate.theta_indices])
-            mat = gate.matrix_fun(params, device).to(dtype)
+            mat = gate.matrix_fun(params, device).to(bd)
             cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
         elif isinstance(gate, ParameterOneQubitGate):
-            mat = gate.matrix_fun(theta[gate.theta_index], device).to(dtype)
+            mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
             cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
         elif isinstance(gate, NonParameterOneQubitGate):
-            mat = gate.matrix_fun(None, device).to(dtype)
+            mat = gate.matrix_fun(None, device).to(bd)
             cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
         elif isinstance(gate, ParameterTwoQubitGate):
             q0, q1 = gate.qubits
-            mat = gate.matrix_fun(theta[gate.theta_index], device).to(dtype)
+            mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
             _lo, _hi = min(q0, q1), max(q0, q1)
             is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
             if is_adj:
                 if _lo == 0 and _hi == N - 1:
                     if q0 == N - 1 and q1 == 0:
-                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
                     else:
                         cores[N-1], cores[0] = _apply_2q_diff(
-                            _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+                            _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
                 elif q0 < q1:
-                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
                 else:
                     cores[q1], cores[q0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
+                        _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
             else:
-                _swap_route_apply(cores, q0, q1, mat, dtype, N)
+                _swap_route_apply(cores, q0, q1, mat, bd, N)
         elif isinstance(gate, NonParameterTwoQubitsGate):
             q0, q1 = gate.qubits
-            mat = gate.matrix_fun(device=device).to(dtype)
+            mat = gate.matrix_fun(device=device).to(bd)
             _lo, _hi = min(q0, q1), max(q0, q1)
             is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
             if is_adj:
                 if _lo == 0 and _hi == N - 1:
                     if q0 == N - 1 and q1 == 0:
-                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], dtype)
+                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
                     else:
                         cores[N-1], cores[0] = _apply_2q_diff(
-                            _swap_gate_matrix(mat), cores[N-1], cores[0], dtype)
+                            _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
                 elif q0 < q1:
-                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], dtype)
+                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
                 else:
                     cores[q1], cores[q0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[q1], cores[q0], dtype)
+                        _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
             else:
-                _swap_route_apply(cores, q0, q1, mat, dtype, N)
+                _swap_route_apply(cores, q0, q1, mat, bd, N)
 
-    return torch.stack(cores, dim=0)
+    # Upcast to contraction dtype for backward precision
+    tensor = torch.stack(cores, dim=0)
+    return tensor.to(dtype) if dtype != build_dtype else tensor
 
 
 def _contraction_diff(tensor, hamiltonian, dtype=torch.complex128):
@@ -356,7 +358,6 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
     Returns:
         (grad, loss_value): (P,) float32 gradient, scalar expectation value
     """
-    real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
     N, chi = circuit.num_qubit, circuit.rank
 
     if term_chunk is None:
@@ -367,7 +368,8 @@ def autograd_gradient(theta, circuit, hamiltonian, dtype=torch.complex128,
         hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
 
     with torch.enable_grad():
-        theta_ad = theta.detach().to(real_dtype).clone().requires_grad_(True)
+        # Use float32 for theta (gate matrices are cfloat internally)
+        theta_ad = theta.detach().float().clone().requires_grad_(True)
         tensor = _build_tensor_diff(theta_ad, circuit, dtype)
         loss = _contraction_diff_vectorized(tensor, hamiltonian, dtype,
                                             term_chunk=term_chunk)
