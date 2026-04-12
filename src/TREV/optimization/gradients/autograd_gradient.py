@@ -77,73 +77,100 @@ def _apply_2q_diff(gate_matrix, qu0, qu1, dtype):
     return torch.moveaxis(q0, 0, 2), torch.moveaxis(q1, 1, 2)
 
 
-def _build_tensor_diff(theta, circuit, dtype=torch.complex128):
+def _apply_gate(gate, cores, theta, device, bd, N):
+    """Apply a single gate to cores (functional, no in-place)."""
+    if isinstance(gate, ParameterMultiOneQubitGate):
+        params = torch.stack([theta[i] for i in gate.theta_indices])
+        mat = gate.matrix_fun(params, device).to(bd)
+        cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
+    elif isinstance(gate, ParameterOneQubitGate):
+        mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
+        cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
+    elif isinstance(gate, NonParameterOneQubitGate):
+        mat = gate.matrix_fun(None, device).to(bd)
+        cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
+    elif isinstance(gate, ParameterTwoQubitGate):
+        q0, q1 = gate.qubits
+        mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
+        _lo, _hi = min(q0, q1), max(q0, q1)
+        is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
+        if is_adj:
+            if _lo == 0 and _hi == N - 1:
+                if q0 == N - 1 and q1 == 0:
+                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
+                else:
+                    cores[N-1], cores[0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
+            elif q0 < q1:
+                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
+            else:
+                cores[q1], cores[q0] = _apply_2q_diff(
+                    _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
+        else:
+            _swap_route_apply(cores, q0, q1, mat, bd, N)
+    elif isinstance(gate, NonParameterTwoQubitsGate):
+        q0, q1 = gate.qubits
+        mat = gate.matrix_fun(device=device).to(bd)
+        _lo, _hi = min(q0, q1), max(q0, q1)
+        is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
+        if is_adj:
+            if _lo == 0 and _hi == N - 1:
+                if q0 == N - 1 and q1 == 0:
+                    cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
+                else:
+                    cores[N-1], cores[0] = _apply_2q_diff(
+                        _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
+            elif q0 < q1:
+                cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
+            else:
+                cores[q1], cores[q0] = _apply_2q_diff(
+                    _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
+        else:
+            _swap_route_apply(cores, q0, q1, mat, bd, N)
+
+
+def _apply_gate_segment(stacked_cores, theta, gates, device, bd, N):
+    """Apply a segment of gates. Used with gradient checkpointing."""
+    cores = list(stacked_cores.unbind(0))
+    for gate in gates:
+        _apply_gate(gate, cores, theta, device, bd, N)
+    return torch.stack(cores, dim=0)
+
+
+def _build_tensor_diff(theta, circuit, dtype=torch.complex128, checkpoint_every=8):
     """Build tensor ring with autograd tracking (no in-place ops).
 
     Uses cfloat for gate application and SVD (matching build_tensor exactly),
     then upcasts to dtype for the contraction backward pass.
+
+    Gradient checkpointing: splits gate applications into segments of
+    `checkpoint_every` gates. Each segment's forward is recomputed during
+    backward, limiting SVD backward error accumulation to segment length.
     """
     N, chi = circuit.num_qubit, circuit.rank
     device = circuit.device
-    # Build in cfloat to match build_tensor's precision and SVD behavior
     build_dtype = torch.cfloat
     cores = [torch.zeros(chi, chi, 2, dtype=build_dtype, device=device) for _ in range(N)]
     for i in range(N):
         cores[i][0, 0, 0] = 1.0
 
-    bd = build_dtype  # shorthand
-    for gate in circuit.gates:
-        if isinstance(gate, ParameterMultiOneQubitGate):
-            params = torch.stack([theta[i] for i in gate.theta_indices])
-            mat = gate.matrix_fun(params, device).to(bd)
-            cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
-        elif isinstance(gate, ParameterOneQubitGate):
-            mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
-            cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
-        elif isinstance(gate, NonParameterOneQubitGate):
-            mat = gate.matrix_fun(None, device).to(bd)
-            cores[gate.qubit] = _apply_single_qubit_gate(mat, cores[gate.qubit])
-        elif isinstance(gate, ParameterTwoQubitGate):
-            q0, q1 = gate.qubits
-            mat = gate.matrix_fun(theta[gate.theta_index], device).to(bd)
-            _lo, _hi = min(q0, q1), max(q0, q1)
-            is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
-            if is_adj:
-                if _lo == 0 and _hi == N - 1:
-                    if q0 == N - 1 and q1 == 0:
-                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
-                    else:
-                        cores[N-1], cores[0] = _apply_2q_diff(
-                            _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
-                elif q0 < q1:
-                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
-                else:
-                    cores[q1], cores[q0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
-            else:
-                _swap_route_apply(cores, q0, q1, mat, bd, N)
-        elif isinstance(gate, NonParameterTwoQubitsGate):
-            q0, q1 = gate.qubits
-            mat = gate.matrix_fun(device=device).to(bd)
-            _lo, _hi = min(q0, q1), max(q0, q1)
-            is_adj = (_hi - _lo == 1) or (_lo == 0 and _hi == N - 1)
-            if is_adj:
-                if _lo == 0 and _hi == N - 1:
-                    if q0 == N - 1 and q1 == 0:
-                        cores[N-1], cores[0] = _apply_2q_diff(mat, cores[N-1], cores[0], bd)
-                    else:
-                        cores[N-1], cores[0] = _apply_2q_diff(
-                            _swap_gate_matrix(mat), cores[N-1], cores[0], bd)
-                elif q0 < q1:
-                    cores[q0], cores[q1] = _apply_2q_diff(mat, cores[q0], cores[q1], bd)
-                else:
-                    cores[q1], cores[q0] = _apply_2q_diff(
-                        _swap_gate_matrix(mat), cores[q1], cores[q0], bd)
-            else:
-                _swap_route_apply(cores, q0, q1, mat, bd, N)
+    bd = build_dtype
+    gates = circuit.gates
 
-    # Upcast to contraction dtype for backward precision
-    tensor = torch.stack(cores, dim=0)
+    if checkpoint_every and len(gates) > checkpoint_every:
+        # Split gates into segments and checkpoint each
+        tensor = torch.stack(cores, dim=0)
+        for start in range(0, len(gates), checkpoint_every):
+            seg = gates[start:start + checkpoint_every]
+            tensor = torch.utils.checkpoint.checkpoint(
+                _apply_gate_segment, tensor, theta, seg, device, bd, N,
+                use_reentrant=False,
+            )
+    else:
+        for gate in gates:
+            _apply_gate(gate, cores, theta, device, bd, N)
+        tensor = torch.stack(cores, dim=0)
+
     return tensor.to(dtype) if dtype != build_dtype else tensor
 
 

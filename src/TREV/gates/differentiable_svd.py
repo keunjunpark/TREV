@@ -1,12 +1,13 @@
 """
 Differentiable truncated SVD for complex tensor ring circuits.
 
-Implements the corrected backward from:
-- peps-torch (Hasik) — F/G split regularization + complex correction
-- Francuz et al. (2311.11894) — truncation correction terms
+Implements the Wan-Zhang complex SVD backward formula (arXiv:1909.02659)
+which correctly handles the phase degree of freedom via an extra
+anti-Hermitian diagonal correction term. This produces correct gradients
+for gauge-invariant losses (like tensor ring contractions) without
+requiring gauge fixing or real-form conversion.
 
-Returns (Uk, Sk, Vhk) as separate tensors so both qu0=Uk*Sk and qu1=Vhk
-get gradients through the single backward call.
+The F-matrix uses Lorentzian broadening for degenerate singular values.
 """
 import torch
 
@@ -19,100 +20,91 @@ def _safe_inv(x, eps=1e-12):
 class TruncatedSVD(torch.autograd.Function):
     """
     Forward: A (m,n) → Uk (m,k), Sk (k,), Vhk (k,n)
-    Backward: corrected formula with F/G split regularization.
-
-    Both Uk and Vhk are autograd-connected to A. The caller forms
-    qu0 = Uk * Sk and qu1 = Vhk; autograd naturally propagates
-    gradients from both back through this single backward.
+    Backward: Wan-Zhang formula with correct complex phase correction.
     """
 
     @staticmethod
     def forward(ctx, A, k):
         U_full, S_full, Vh_full = torch.linalg.svd(A, full_matrices=False)
-        Uk = U_full[:, :k].contiguous()
-        Sk = S_full[:k].contiguous()
-        Vhk = Vh_full[:k, :].contiguous()
         ctx.save_for_backward(U_full, S_full, Vh_full)
         ctx.k = k
         ctx.shape = A.shape
-        return Uk, Sk, Vhk
+        return (U_full[:, :k].contiguous(),
+                S_full[:k].contiguous(),
+                Vh_full[:k, :].contiguous())
 
     @staticmethod
     def backward(ctx, dU, dS, dVh):
-        U_full, S_full, Vh_full = ctx.saved_tensors
+        U, S, Vh = ctx.saved_tensors
         m, n = ctx.shape
-
-        # Upcast to float64 for backward stability (forward stays in original dtype)
-        orig_dtype = U_full.dtype
-        if U_full.dtype == torch.cfloat:
-            U_full = U_full.to(torch.complex128)
-            S_full = S_full.to(torch.float64)
-            Vh_full = Vh_full.to(torch.complex128)
-            dU = dU.to(torch.complex128)
-            dS = dS.to(torch.float64)
-            dVh = dVh.to(torch.complex128)
         k = ctx.k
-        r = S_full.shape[0]  # min(m, n)
-        is_complex = U_full.is_complex()
-        dtype = U_full.dtype
-        device = U_full.device
+        r = S.shape[0]
+        is_complex = U.is_complex()
+        dtype = U.dtype
+        device = U.device
 
-        # Pad incoming gradients to full SVD size
-        dU_full = torch.zeros(m, r, dtype=dtype, device=device)
-        dU_full[:, :k] = dU
-        dS_full = torch.zeros(r, dtype=S_full.dtype, device=device)
-        dS_full[:k] = dS
-        dVh_full = torch.zeros(r, n, dtype=dtype, device=device)
-        dVh_full[:k, :] = dVh
+        # Upcast for backward stability
+        orig_dtype = dtype
+        if dtype in (torch.cfloat, torch.float32):
+            hi = torch.complex128 if is_complex else torch.float64
+            U = U.to(hi); S = S.to(torch.float64); Vh = Vh.to(hi)
+            dU = dU.to(hi); dS = dS.to(torch.float64); dVh = dVh.to(hi)
+            dtype = hi
 
-        U = U_full[:, :r]
-        S = S_full[:r]
-        Vh = Vh_full[:r, :]
+        eps = 1e-12
         V = Vh.mH
-
-        eps = 1e-12 if S.dtype == torch.float64 else 1e-6
-
-        # ── TensorKit.jl convention: inv_diff = 1/(Sj - Si), inv_sum = 1/(Sj + Si) ──
-        S_col = S.unsqueeze(-2)  # (1, r) = Sj
-        S_row = S.unsqueeze(-1)  # (r, 1) = Si
-        inv_diff = _safe_inv(S_col - S_row, eps)  # 1/(Sj - Si)
-        inv_sum = _safe_inv(S_col + S_row, eps)   # 1/(Sj + Si)
-        eye_r = torch.eye(r, dtype=inv_diff.dtype, device=device)
-        inv_diff = inv_diff * (1 - eye_r)
-        inv_sum = inv_sum * (1 - eye_r)
-
         Uh = U.mH
-        V = Vh.mH
         S_inv = _safe_inv(S, eps).to(dtype)
 
-        # ── Anti-Hermitian parts ──
-        UhdU = Uh @ dU_full
-        VhdV = V.mH @ dVh_full.mH  # = Vh @ dV where dV = dVh^H
-        aUdU = (UhdU - UhdU.mH) / 2
-        aVdV = (VhdV - VhdV.mH) / 2
+        # Pad gradients to full SVD size
+        gU = torch.zeros(m, r, dtype=dtype, device=device)
+        gU[:, :k] = dU
+        gS = torch.zeros(r, dtype=S.dtype, device=device)
+        gS[:k] = dS
+        gVh = torch.zeros(r, n, dtype=dtype, device=device)
+        gVh[:k, :] = dVh
+        gV = gVh.mH  # (n, r)
 
-        # ── UdAV matrix (combined F-term from TensorKit.jl) ──
-        UdAV = ((aUdU + aVdV) * inv_diff + (aUdU - aVdV) * inv_sum).to(dtype)
-        UdAV = UdAV + torch.diag_embed(dS_full.to(dtype))
+        # F-matrix: F_ij = 1/(s_i^2 - s_j^2) for i != j
+        S2 = S * S
+        E = S2.unsqueeze(-2) - S2.unsqueeze(-1)
+        eye_r = torch.eye(r, dtype=E.dtype, device=device)
+        F = _safe_inv(E, eps) * (1 - eye_r)  # Lorentzian for degenerate pairs
 
-        dA = U @ UdAV @ Vh
+        S_dtype = S.to(dtype)
+        dA = torch.zeros(m, n, dtype=dtype, device=device)
 
-        # ── Complement projection terms ──
+        # dS contribution
+        dA = dA + U @ torch.diag_embed(gS.to(dtype)) @ Vh
+
+        # dU contribution (skew-Hermitian part)
+        UhgU = Uh @ gU
+        skew_U = UhgU - UhgU.mH
+        u_term = U @ (F * skew_U * S_dtype.unsqueeze(-2)) @ Vh
+        dA = dA + u_term
+
+        # Complement projection for U (when m > r)
         if m > r:
-            dU_perp = dU_full - U @ (Uh @ dU_full)
-            dA = dA + dU_perp @ (S_inv.unsqueeze(-1) * Vh)
+            proj_U = gU - U @ (Uh @ gU)
+            dA = dA + proj_U @ (S_inv.unsqueeze(-1) * Vh)
+
+        # dVh contribution (skew-Hermitian part)
+        VhgV = Vh @ gV
+        skew_V = VhgV - VhgV.mH
+        v_term = U @ (S_dtype.unsqueeze(-1) * F * skew_V) @ Vh
+        dA = dA + v_term
+
+        # Complement projection for V (when n > r)
         if n > r:
-            dVh_perp = dVh_full - (dVh_full @ V) @ Vh
-            dA = dA + (U * S_inv.unsqueeze(-2)) @ dVh_perp
+            proj_V = gV - V @ (Vh @ gV)
+            dA = dA + (U * S_inv.unsqueeze(-2)) @ proj_V.mH
 
-        # ── Complex correction: imaginary diagonal of U^H dU ──
+        # Wan-Zhang complex phase correction
         if is_complex:
-            L_diag = (Uh @ dU_full).diagonal()
-            L_corr = torch.zeros_like(L_diag)
-            L_corr.imag = L_diag.imag * S_inv.real
-            dA = dA + (U * L_corr.unsqueeze(-2)) @ Vh
+            L_diag = UhgU.diagonal()
+            L_anti = L_diag - L_diag.conj()  # 2i * Im(diag(U^H gU))
+            dA = dA + U @ torch.diag_embed(0.5 * L_anti * S_inv) @ Vh
 
-        # Downcast back to original dtype
         return dA.to(orig_dtype), None
 
 
@@ -121,8 +113,10 @@ def diff_svd(A, k):
     Differentiable truncated SVD.
 
     Returns Uk (m,k), Sk (k,), Vhk (k,n).
-    Both Uk and Vhk have gradients connected to A through the backward.
+    Both Uk and Vhk have gradients connected to A.
 
-    Use: qu0 = Uk * Sk.unsqueeze(0), qu1 = Vhk
+    Uses the Wan-Zhang formula (arXiv:1909.02659) for the complex
+    backward, which correctly handles the phase degree of freedom
+    for gauge-invariant losses.
     """
     return TruncatedSVD.apply(A, k)
