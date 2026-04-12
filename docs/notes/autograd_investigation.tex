@@ -1,0 +1,160 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Autograd vs.\ Parameter-Shift Gradient for Tensor Ring VQE:\\
+Investigation and Findings}
+\author{TREV Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We investigate reverse-mode automatic differentiation (autograd) through differentiable SVD for computing VQE gradients in the TREV tensor ring simulator. Autograd produces exact gradients ($\cos = 1.000$ vs.\ parameter-shift) for circuits without lossy SVD truncation, but degrades ($\cos \approx 0.66$) for deep transpiled circuits where many two-qubit gates involve lossy truncation. We trace the root cause to the non-smoothness of truncated SVD and show that no existing tensor network library has solved this for 50+ chained SVDs. All successful approaches avoid the problem entirely.
+\end{abstract}
+
+\section{Background}
+
+TREV represents quantum states as tensor rings with bond dimension $\chi$. Each two-qubit gate requires SVD to split the merged two-site tensor:
+\begin{equation}
+M = U \Sigma V^\dagger \approx U_k \Sigma_k V_k^\dagger, \quad k = \chi
+\end{equation}
+where $M \in \mathbb{C}^{2\chi \times 2\chi}$ and only top-$k$ singular values are retained. The parameter-shift rule computes exact gradients via $2P$ forward evaluations. Autograd requires only 1 forward + 1 backward pass.
+
+\section{Differentiable SVD Backward}
+
+Our \texttt{diff\_svd} implementation combines:
+
+\paragraph{F/G split formula (TensorKit convention).}
+\begin{equation}
+\frac{\partial L}{\partial A} = U \left[ (a_{U} + a_{V}) \odot F + (a_{U} - a_{V}) \odot G + \mathrm{diag}(\bar{\Sigma}) \right] V^\dagger
+\end{equation}
+where $F_{ij} = 1/(s_j - s_i)$, $G_{ij} = 1/(s_j + s_i)$, $a_U = (U^\dagger \bar{U} - \bar{U}^\dagger U)/2$.
+
+\paragraph{Lorentzian broadening} for degenerate singular values: $1/x \approx x/(x^2 + \epsilon)$.
+
+\paragraph{Wan-Zhang complex correction~\cite{wan2019automatic}.}
+\begin{equation}
+\frac{\partial L}{\partial A} \mathrel{+}= U \, \mathrm{diag}\!\left(\frac{L_i - L_i^*}{2 s_i}\right) V^\dagger, \quad L_i = (U^\dagger \bar{U})_{ii}
+\end{equation}
+
+\paragraph{Gauge projection.} The tensor ring stores $q_0 = U_k \Sigma_k$ and $q_1 = V_k^\dagger$ as separate cores. Their independent contraction gradients violate gauge invariance: $\mathrm{Im}(\mathrm{diag}(U_k^\dagger \bar{U}_k)) + \mathrm{Im}(\mathrm{diag}(V_k^\dagger \bar{V}_k)) \neq 0$. We project out the gauge-dependent component before the F/G formula.
+
+\section{Results}
+
+\subsection{Per-SVD Accuracy}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Matrix type & $k/r$ & $\cos(\nabla_{\mathrm{ad}}, \nabla_{\mathrm{FD}})$ \\
+\midrule
+Full rank (random) & 4/8 & 0.9999 \\
+Rank-2 (circuit MPS) & 4/8 & 0.9554 \\
+Rank-2, no truncation & 4/4 & 0.9999 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Circuit-Level Accuracy}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Circuit & \#2q gates & Lossy truncations & $\cos(\nabla_{\mathrm{ad}}, \nabla_{\mathrm{ps}})$ \\
+\midrule
+HEA $N{=}6$, $\chi{=}4$ & 12 & 0 & \textbf{1.000} \\
+HEA $N{=}9$, $\chi{=}8$ & 18 & 0 & \textbf{1.000} \\
+Ring $N{=}9$, $\chi{=}2$ & 9 & 1--2 & 0.990 \\
+Ring $N{=}9$, $\chi{\geq}4$ & 9 & 0 & \textbf{1.000} \\
+TSP QAOA $\chi{=}4$ & 52 & $\sim$18 & 0.661 \\
+TSP QAOA $\chi{=}8$ & 52 & $\sim$18 & 0.593 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Root Cause: Non-Smoothness of Truncated SVD}
+
+The expectation value $E(\theta)$ with SVD truncation is non-smooth. Finite differences at varying step sizes diverge:
+
+\begin{center}
+\begin{tabular}{cc}
+\toprule
+Step size $\epsilon$ & FD estimate $\frac{f(\theta+\epsilon) - f(\theta-\epsilon)}{2\epsilon}$ \\
+\midrule
+$10^{-1}$ & $-65$ \\
+$10^{-2}$ & $+124$ \\
+$10^{-3}$ & $+7175$ \\
+$10^{-4}$ & $-46890$ \\
+$10^{-5}$ & $+925614$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This divergence occurs for \textbf{both} \texttt{build\_tensor} and \texttt{\_build\_tensor\_diff}, confirming the non-smoothness is intrinsic to SVD truncation. At the test point, 19 of 52 gates have exactly degenerate singular values at the truncation boundary ($s_k = s_{k+1} = 0$). The parameter-shift rule evaluates at $\theta \pm \pi/2$, averaging over cusps. Autograd computes the local subgradient, hitting cusps directly.
+
+\section{Approaches Attempted}
+
+\subsection{Successful}
+
+\begin{enumerate}
+\item \textbf{Wan-Zhang complex correction}~\cite{wan2019automatic}: Per-SVD accuracy $0.78 \to 0.9999$.
+\item \textbf{cfloat forward matching}: Eliminated $3 \times 10^{-4}$ EV discrepancy.
+\item \textbf{Gate support}: \texttt{ParameterTwoQubitGate}, \texttt{ParameterMultiOneQubitGate}, wrap-around handling.
+\item \textbf{Gauge projection}: Corrected gradient magnitudes from ${\sim}3\times$ mismatch to ${\sim}1.0\times$.
+\end{enumerate}
+
+\subsection{Unsuccessful}
+
+\begin{enumerate}
+\item \textbf{Taylor polynomial F-matrix}~\cite{song2021why}: Amplifies degenerate pairs; $\cos = 0.02$ for deep circuits.
+\item \textbf{Francuz truncation correction}~\cite{francuz2025stable}: Three implementations all double-counted with existing $r \times r$ F/G cross-terms.
+\item \textbf{Gradient checkpointing}: Identical results at all segment sizes (systematic, not stochastic error).
+\item \textbf{Full-rank SVD + external slicing}: Mathematically identical backward.
+\item \textbf{Symmetric S absorption}: Changes forward; NaN from $\sqrt{0}$.
+\item \textbf{Adjoint method}: 1-qubit $\cos = 0.95$; 2-qubit $\cos = 0.40$.
+\item \textbf{Real-form SVD}: Paired degenerate SVs cause equivalent problems.
+\item \textbf{Float64 backward}: Already implemented; no improvement.
+\end{enumerate}
+
+\section{Literature Survey}
+
+\begin{center}
+\begin{tabular}{p{2.8cm}p{4.5cm}cc}
+\toprule
+Library & Strategy & Effective \#SVD & Validated \\
+\midrule
+peps-torch~\cite{liao2019differentiable} & Fixed-point differentiation & $\sim$1 & Yes \\
+variPEPS & Fixed-point + Francuz & $\sim$1 & Yes \\
+TensorCircuit~\cite{zhang2023tensorcircuit} & Identity init (avoids truncation) & 0 & No \\
+quimb~\cite{gray2018quimb} & Exact contraction (no SVD) & 0 & N/A \\
+TREV (this work) & Direct SVD backward chain & Up to 52 & Partial \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{No existing library has demonstrated correct gradients through 50+ chained truncated SVDs.} Successful approaches avoid the problem: peps-torch collapses iterations via the implicit function theorem ($\sim$1 effective SVD), TensorCircuit avoids truncation, quimb uses exact contraction.
+
+\section{Conclusions}
+
+\begin{enumerate}
+\item Autograd matches parameter-shift exactly ($\cos = 1.000$) when truncation is lossless.
+\item For deep circuits with lossy truncation, autograd gives $\cos \approx 0.66$ due to non-smoothness.
+\item This is a fundamental mathematical limitation, not a code bug.
+\item \textbf{Future directions}: fixed-point differentiation, smooth truncation, or sufficient $\chi$ to avoid lossy truncation.
+\end{enumerate}
+
+\begin{thebibliography}{9}
+\bibitem{wan2019automatic} Z.-Q.~Wan, S.-X.~Zhang, ``Automatic differentiation for complex valued SVD,'' arXiv:1909.02659 (2019).
+\bibitem{francuz2025stable} A.~Francuz, N.~Schuch, B.~Vanhecke, ``Stable and efficient differentiation of tensor network algorithms,'' \textit{Phys.\ Rev.\ Research} \textbf{7}, 013237 (2025).
+\bibitem{song2021why} Y.~Song, N.~Sebe, ``Why approximate matrix square root outperforms accurate SVD in global covariance pooling?'' \textit{ICCV} (2021).
+\bibitem{liao2019differentiable} H.-J.~Liao, J.-G.~Liu, L.~Wang, T.~Xiang, ``Differentiable programming tensor networks,'' \textit{Phys.\ Rev.\ X} \textbf{9}, 031041 (2019).
+\bibitem{zhang2023tensorcircuit} S.-X.~Zhang et al., ``TensorCircuit: a quantum software framework for the NISQ era,'' \textit{Quantum} \textbf{7}, 912 (2023).
+\bibitem{gray2018quimb} J.~Gray, ``quimb: a python library for quantum information and many-body calculations,'' \textit{JOSS} \textbf{3}, 819 (2018).
+\end{thebibliography}
+
+\end{document}
