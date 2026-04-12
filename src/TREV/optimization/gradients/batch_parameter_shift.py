@@ -567,7 +567,7 @@ def _kron_contract_right(Prod, A0, A1, op=0):
     Prod: (B, chi, chi, chi, chi)  -- 4D spatial dims
     A0, A1: (B, chi, chi)
 
-    Uses fused einsum: result[b,i,j,m,n] = sum_{k,l} Prod[b,i,j,k,l] * conj(Abra[b,k,m]) * Aket[b,l,n]
+    Fused einsum: result[b,i,j,m,n] = sum_{k,l} Prod[b,i,j,k,l] * conj(Abra[b,k,m]) * Aket[b,l,n]
     """
     A0c = A0.conj()
     A1c = A1.conj()
