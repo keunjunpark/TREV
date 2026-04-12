@@ -5,6 +5,12 @@ for variational quantum circuits.
 Population-based, derivative-free optimizer that maintains a multivariate
 Gaussian and adapts its covariance matrix to learn parameter correlations.
 
+Optimized for GPU:
+  - Vectorized rank-mu covariance update (no Python loop)
+  - Cached eigendecomposition of C (recomputed every `eigen_every` steps)
+  - Avoids materializing diagonal matrices
+  - Skips redundant tensor builds for best-bitstring tracking
+
 Reference:
     Hansen, N. & Ostermeier, A. (2001). "Completely derandomized
     self-adaptation in evolution strategies." Evolutionary Computation 9(2).
@@ -37,6 +43,9 @@ class CMAES:
         How to evaluate expectation values.
     shots : int
         Measurement shots per evaluation (0 = exact contraction).
+    eigen_every : int
+        Recompute eigendecomposition of C every this many generations.
+        C changes gradually, so skipping saves O(n^3) per step.
     """
 
     def __init__(
@@ -45,11 +54,13 @@ class CMAES:
         pop_size: int | None = None,
         measure_method: MeasureMethod = MeasureMethod.RIGHT_SUFFIX_SAMPLING,
         shots: int = 10000,
+        eigen_every: int = 1,
     ):
         self.sigma0 = sigma
         self.pop_size_override = pop_size
         self.measure_method = measure_method
         self.shots = shots
+        self.eigen_every = eigen_every
 
     # ------------------------------------------------------------------ #
     #  Core CMA-ES logic (follows Hansen's tutorial notation)             #
@@ -89,13 +100,25 @@ class CMAES:
         C = torch.eye(n, device=device, dtype=torch.float64)
         sigma = self.sigma0
 
+        # Cached eigen decomposition
+        BD = torch.eye(n, device=device, dtype=torch.float64)  # B * D
+        invsqrtC = torch.eye(n, device=device, dtype=torch.float64)
+
         return dict(
             n=n, lam=lam, mu=mu, weights=weights, mu_eff=mu_eff,
             c_sigma=c_sigma, d_sigma=d_sigma, E_chi=E_chi,
             cc=cc, c1=c1, c_mu=c_mu,
             mean=mean, p_sigma=p_sigma, p_c=p_c, C=C, sigma=sigma,
-            device=device,
+            BD=BD, invsqrtC=invsqrtC,
+            device=device, gen_count=0,
         )
+
+    def _update_eigen(self, s):
+        """Eigendecompose C and cache BD and invsqrtC."""
+        D2, B = torch.linalg.eigh(s['C'])
+        D = torch.sqrt(torch.clamp(D2, min=1e-20))
+        s['BD'] = B * D                        # (n, n) — avoids diag matrix
+        s['invsqrtC'] = (B / D) @ B.T          # B @ diag(1/D) @ B^T without materializing diag
 
     def _step(self, s, evaluate_fn):
         """Run one CMA-ES generation.
@@ -111,26 +134,29 @@ class CMAES:
         -------
         best_cost : float
             Best cost in this generation.
+        best_params : torch.Tensor
+            Parameters of the best individual, shape (n,).
         """
         n, lam, mu = s['n'], s['lam'], s['mu']
         device = s['device']
 
-        # Eigendecompose C for sampling (C = B D^2 B^T)
-        D2, B = torch.linalg.eigh(s['C'])
-        D = torch.sqrt(torch.clamp(D2, min=1e-20))
-        invsqrtC = B @ torch.diag(1.0 / D) @ B.T
+        # Recompute eigen decomposition periodically
+        if s['gen_count'] % self.eigen_every == 0:
+            self._update_eigen(s)
+        s['gen_count'] += 1
 
-        # Sample population: x_k = mean + sigma * B D z_k
+        # Sample population: x_k = mean + sigma * BD @ z_k
         z = torch.randn(lam, n, device=device, dtype=torch.float64)
-        y = z @ (B * D).T  # (lam, n)
-        population = s['mean'] + s['sigma'] * y  # (lam, n)
+        y = z @ s['BD'].T                          # (lam, n)
+        population = s['mean'] + s['sigma'] * y     # (lam, n)
 
-        # Evaluate
-        costs = evaluate_fn(population.float())  # (lam,)
+        # Evaluate all individuals in one batched call
+        costs = evaluate_fn(population.float())     # (lam,)
 
         # Sort by cost (minimization)
         order = torch.argsort(costs)
-        y_sel = y[order[:mu]]  # (mu, n) — selected steps
+        y_sel = y[order[:mu]]                       # (mu, n) — selected steps
+        best_params = population[order[0]]           # (n,)
 
         # Weighted recombination
         y_w = (s['weights'].unsqueeze(1) * y_sel).sum(dim=0)  # (n,)
@@ -140,7 +166,7 @@ class CMAES:
         s['p_sigma'] = (
             (1.0 - s['c_sigma']) * s['p_sigma']
             + math.sqrt(s['c_sigma'] * (2.0 - s['c_sigma']) * s['mu_eff'])
-            * (invsqrtC @ y_w)
+            * (s['invsqrtC'] @ y_w)
         )
         norm_ps = torch.linalg.norm(s['p_sigma']).item()
         s['sigma'] *= math.exp(
@@ -149,7 +175,7 @@ class CMAES:
 
         # Covariance path
         h_sigma = 1.0 if (
-            norm_ps / math.sqrt(1.0 - (1.0 - s['c_sigma']) ** (2 * (1 + 1)))
+            norm_ps / math.sqrt(1.0 - (1.0 - s['c_sigma']) ** (2 * (s['gen_count'] + 1)))
             < (1.4 + 2.0 / (n + 1.0)) * s['E_chi']
         ) else 0.0
 
@@ -159,19 +185,21 @@ class CMAES:
             * y_w
         )
 
-        # Covariance matrix update
+        # Covariance matrix update — vectorized rank-mu
         rank_one = s['p_c'].unsqueeze(1) @ s['p_c'].unsqueeze(0)
-        rank_mu = sum(
-            s['weights'][i] * y_sel[i].unsqueeze(1) @ y_sel[i].unsqueeze(0)
-            for i in range(mu)
-        )
+        # rank_mu = sum_i w_i * y_sel[i] @ y_sel[i]^T
+        #         = y_sel^T @ diag(w) @ y_sel
+        #         = (sqrt(w) * y_sel)^T @ (sqrt(w) * y_sel)
+        w_y = s['weights'].sqrt().unsqueeze(1) * y_sel   # (mu, n)
+        rank_mu = w_y.T @ w_y                             # (n, n)
+
         s['C'] = (
             (1.0 - s['c1'] - s['c_mu']) * s['C']
             + s['c1'] * rank_one
             + s['c_mu'] * rank_mu
         )
 
-        return costs[order[0]].item()
+        return costs[order[0]].item(), best_params
 
 
 def minimize_cma_es(
@@ -182,8 +210,15 @@ def minimize_cma_es(
     generations: int,
     best_value_method: str,
     wall_clock_cap: float | None = None,
+    bitstring_every: int = 10,
 ):
     """CMA-ES optimization loop for variational quantum circuits.
+
+    Parameters
+    ----------
+    bitstring_every : int
+        Compute best bitstring every N generations (expensive).
+        The last generation always computes it.
 
     Returns
     -------
@@ -207,6 +242,7 @@ def minimize_cma_es(
     best_result = []
     iteration_times = []
     start = time.time()
+    last_bitstring = None
 
     def evaluate_fn(population: torch.Tensor) -> torch.Tensor:
         """Evaluate a population of parameter vectors."""
@@ -218,7 +254,7 @@ def minimize_cma_es(
     for gen in range(generations):
         it_time = time.time()
 
-        best_cost = cma._step(s, evaluate_fn)
+        best_cost, best_params = cma._step(s, evaluate_fn)
 
         if device == 'cuda':
             torch.cuda.synchronize()
@@ -229,26 +265,23 @@ def minimize_cma_es(
         # Update theta to current mean
         theta = s['mean'].float()
 
-        # Best bitstring from current mean
-        with torch.no_grad():
-            _tensor = circuit.build_tensor(theta)
+        # Best bitstring — only compute every N gens (build_tensor is expensive)
+        is_last = (gen == generations - 1)
+        if gen % bitstring_every == 0 or is_last:
+            with torch.no_grad():
+                _tensor = circuit.build_tensor(best_params.float())
 
-        if best_value_method == 'highest_probability':
-            best_result.append(
-                get_value_of_highest_probability(_tensor, device)
-            )
-        elif best_value_method == 'argmax_tr_noinv_BE':
-            best_result.append(
-                argmax_bitstring_tr_right_suffix(_tensor)
-            )
-        elif best_value_method == 'full_contraction':
-            best_idx = contract_tensor_ring(_tensor).abs().pow(2).argmax().item()
-            best_bitstring = format(best_idx, f'0{circuit.num_qubit}b')
-            best_result.append(best_bitstring[::-1])
-        else:
-            best_result.append(
-                get_value_of_highest_probability(_tensor, device)
-            )
+            if best_value_method == 'highest_probability':
+                last_bitstring = get_value_of_highest_probability(_tensor, device)
+            elif best_value_method == 'argmax_tr_noinv_BE':
+                last_bitstring = argmax_bitstring_tr_right_suffix(_tensor)
+            elif best_value_method == 'full_contraction':
+                best_idx = contract_tensor_ring(_tensor).abs().pow(2).argmax().item()
+                last_bitstring = format(best_idx, f'0{circuit.num_qubit}b')[::-1]
+            else:
+                last_bitstring = get_value_of_highest_probability(_tensor, device)
+
+        best_result.append(last_bitstring)
 
         # Progress
         _progress_bar(gen, generations, start, best_cost)
