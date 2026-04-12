@@ -725,7 +725,12 @@ def expectation_value_batch_efficient_contraction(
             # Tr(run @ R_suf[s_last+1]) = element-wise product with transposed suffix
             totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
 
-        out_parts.append(totals.real.float())
+        # Normalize: <psi|H|psi> / <psi|psi>
+        # For deep circuits, SVD truncation causes <psi|psi> to shrink exponentially.
+        # L_pre[N] is the all-identity product; its trace gives <psi|psi>.
+        norm_sq = (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4)).real
+        norm_sq = norm_sq.clamp_min(1e-30)  # guard against division by zero
+        out_parts.append((totals.real / norm_sq).float())
 
         del sites, L_pre, R_suf_T, totals
 
