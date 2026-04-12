@@ -690,47 +690,51 @@ def expectation_value_batch_efficient_contraction(
         # --- Per-term contraction: only at non-identity sites ---
         totals = torch.zeros(B, dtype=ctype, device=device)
 
-        # Group single-site terms by (site, op) to batch them.
-        # Key: (site, op) -> summed coefficient
+        # Move op_tensor to CPU numpy ONCE to avoid per-term GPU-CPU syncs.
+        op_np = op_tensor.cpu().numpy()  # (T, N)
+
+        # Pre-classify all terms on CPU (no GPU syncs in this loop).
         from collections import defaultdict
-        single_site_groups = defaultdict(lambda: torch.zeros(1, dtype=ctype, device=device))
-        multi_site_terms = []
-        all_identity_coeff = torch.zeros(1, dtype=ctype, device=device)
+        single_site_coeffs = defaultdict(float)  # (site, op) -> summed coeff (python float)
+        multi_site_terms = []  # list of (t, non_i_sites_list, ops_list)
+        all_identity_coeff = 0.0
 
         for t in range(T):
-            non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()
-            if len(non_i_sites) == 0:
-                all_identity_coeff += coeffs[t]
-            elif len(non_i_sites) == 1:
-                s = non_i_sites[0]
-                op = op_tensor[t, s].item()
-                single_site_groups[(s, op)] += coeffs[t]
+            ops_t = op_np[t]
+            non_i = ops_t.nonzero()[0]
+            c = coeffs[t].item()
+            if len(non_i) == 0:
+                all_identity_coeff += c
+            elif len(non_i) == 1:
+                s = int(non_i[0])
+                single_site_coeffs[(s, int(ops_t[s]))] += c
             else:
-                multi_site_terms.append(t)
+                # Store precomputed per-site ops for the span
+                s_first, s_last = int(non_i[0]), int(non_i[-1])
+                span_ops = [int(ops_t[i]) for i in range(s_first, s_last + 1)]
+                multi_site_terms.append((t, s_first, s_last, span_ops))
 
         # All-identity terms
-        if all_identity_coeff.item() != 0:
+        if all_identity_coeff != 0.0:
             totals += all_identity_coeff * (L_pre[N] * R_suf_T[N]).sum(dim=(1, 2, 3, 4))
 
         # Batched single-site terms: one contraction per (site, op) group
-        for (s, op), coeff_sum in single_site_groups.items():
+        for (s, op), coeff_sum in single_site_coeffs.items():
             A0_s, A1_s = sites[s]
             run = _kron_contract_right(L_pre[s], A0_s, A1_s, op=op)
             totals += coeff_sum * (run * R_suf_T[s + 1]).sum(dim=(1, 2, 3, 4))
 
-        # Multi-site terms: process individually (no clone needed)
-        for t in multi_site_terms:
-            non_i_sites = torch.where(op_tensor[t] != 0)[0].tolist()
-            s_first = non_i_sites[0]
-            s_last = non_i_sites[-1]
+        # Multi-site terms: group by (s_first, s_last, ops_pattern) to deduplicate
+        multi_groups = defaultdict(float)  # (s_first, s_last, tuple(ops)) -> summed coeff
+        for t, s_first, s_last, span_ops in multi_site_terms:
+            key = (s_first, s_last, tuple(span_ops))
+            multi_groups[key] += coeffs[t].item()
 
+        for (s_first, s_last, span_ops), coeff_sum in multi_groups.items():
             run = L_pre[s_first]
-            for i in range(s_first, s_last + 1):
-                A0_i, A1_i = sites[i]
-                op_i = op_tensor[t, i].item()
-                run = _kron_contract_right(run, A0_i, A1_i, op=op_i)
-
-            totals += coeffs[t] * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
+            for idx, i in enumerate(range(s_first, s_last + 1)):
+                run = _kron_contract_right(run, sites[i][0], sites[i][1], op=span_ops[idx])
+            totals += coeff_sum * (run * R_suf_T[s_last + 1]).sum(dim=(1, 2, 3, 4))
 
         # Normalize: <psi|H|psi> / <psi|psi>
         # For deep circuits, SVD truncation causes <psi|psi> to shrink exponentially.
