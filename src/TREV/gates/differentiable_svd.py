@@ -82,7 +82,22 @@ class TruncatedSVD(torch.autograd.Function):
         Uh = U.mH
         S_inv = _safe_inv(S, eps).to(dtype)
 
-        # Anti-Hermitian parts
+        # Gauge projection: ensure Im(diag(U†dU)) + Im(diag(V†dV)) = 0
+        # Without this, independently computed dU and dVh from the tensor ring
+        # contraction violate gauge invariance, causing wrong SVD backward.
+        UhdU_raw = Uh @ dU_full
+        VhdV_raw = V.mH @ dVh_full.mH
+        if is_complex:
+            imag_diag_U = UhdU_raw.diagonal().imag
+            imag_diag_V = VhdV_raw.diagonal().imag
+            delta = (imag_diag_U + imag_diag_V) / 2  # gauge-dependent part
+            # Remove from dU_full: dU_corrected = dU - U @ diag(i*delta)
+            correction_U = U @ torch.diag_embed((1j * delta).to(dtype))
+            correction_Vh = torch.diag_embed((1j * delta).to(dtype)) @ Vh
+            dU_full = dU_full - correction_U
+            dVh_full = dVh_full + correction_Vh
+
+        # Anti-Hermitian parts (now gauge-invariant)
         UhdU = Uh @ dU_full
         VhdV = V.mH @ dVh_full.mH
         aUdU = (UhdU - UhdU.mH) / 2
