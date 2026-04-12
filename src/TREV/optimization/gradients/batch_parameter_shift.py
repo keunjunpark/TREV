@@ -275,10 +275,6 @@ class BatchParameterShiftGradient(Gradient):
         self._verbose = True
 
     def run(self, theta: torch.Tensor, circuit: Circuit, hamiltonian: Hamiltonian):
-        # Apply qubit permutation from transpiled circuits
-        if circuit.qubit_perm is not None:
-            hamiltonian = hamiltonian.permuted(circuit.qubit_perm)
-
         if (self.batch_size is None) and (not self._autotuned):
             device = torch.device(circuit.device) if isinstance(circuit.device, str) else circuit.device
             P = theta.numel()
