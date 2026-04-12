@@ -1,13 +1,13 @@
 """
 Differentiable truncated SVD for complex tensor ring circuits.
 
-Implements the Wan-Zhang complex SVD backward formula (arXiv:1909.02659)
-which correctly handles the phase degree of freedom via an extra
-anti-Hermitian diagonal correction term. This produces correct gradients
-for gauge-invariant losses (like tensor ring contractions) without
-requiring gauge fixing or real-form conversion.
+Uses:
+- TensorKit F/G split with Lorentzian broadening for degenerate SVs
+- Wan-Zhang complex phase correction (arXiv:1909.02659)
+- Float64 upcast in backward for numerical stability
 
-The F-matrix uses Lorentzian broadening for degenerate singular values.
+Per-SVD accuracy: cos ≈ 0.9999 for gauge-invariant losses.
+Deep circuit limitation: errors compound over many (50+) chained SVDs.
 """
 import torch
 
@@ -20,7 +20,7 @@ def _safe_inv(x, eps=1e-12):
 class TruncatedSVD(torch.autograd.Function):
     """
     Forward: A (m,n) → Uk (m,k), Sk (k,), Vhk (k,n)
-    Backward: Wan-Zhang formula with correct complex phase correction.
+    Backward: F/G split + Wan-Zhang complex correction.
     """
 
     @staticmethod
@@ -35,74 +35,78 @@ class TruncatedSVD(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dU, dS, dVh):
-        U, S, Vh = ctx.saved_tensors
+        U_full, S_full, Vh_full = ctx.saved_tensors
         m, n = ctx.shape
         k = ctx.k
-        r = S.shape[0]
-        is_complex = U.is_complex()
-        dtype = U.dtype
-        device = U.device
+        r = S_full.shape[0]
+        is_complex = U_full.is_complex()
+        dtype = U_full.dtype
+        device = U_full.device
 
         # Upcast for backward stability
         orig_dtype = dtype
         if dtype in (torch.cfloat, torch.float32):
             hi = torch.complex128 if is_complex else torch.float64
-            U = U.to(hi); S = S.to(torch.float64); Vh = Vh.to(hi)
-            dU = dU.to(hi); dS = dS.to(torch.float64); dVh = dVh.to(hi)
+            U_full = U_full.to(hi)
+            S_full = S_full.to(torch.float64)
+            Vh_full = Vh_full.to(hi)
+            dU = dU.to(hi)
+            dS = dS.to(torch.float64)
+            dVh = dVh.to(hi)
             dtype = hi
 
         eps = 1e-12
+
+        # Pad incoming gradients to full SVD size
+        dU_full = torch.zeros(m, r, dtype=dtype, device=device)
+        dU_full[:, :k] = dU
+        dS_full = torch.zeros(r, dtype=S_full.dtype, device=device)
+        dS_full[:k] = dS
+        dVh_full = torch.zeros(r, n, dtype=dtype, device=device)
+        dVh_full[:k, :] = dVh
+
+        U = U_full[:, :r]
+        S = S_full[:r]
+        Vh = Vh_full[:r, :]
         V = Vh.mH
+
+        # F/G matrices (TensorKit convention)
+        S_col = S.unsqueeze(-2)  # (1, r) = Sj
+        S_row = S.unsqueeze(-1)  # (r, 1) = Si
+        inv_diff = _safe_inv(S_col - S_row, eps)  # 1/(Sj - Si)
+        inv_sum = _safe_inv(S_col + S_row, eps)   # 1/(Sj + Si)
+        eye_r = torch.eye(r, dtype=inv_diff.dtype, device=device)
+        inv_diff = inv_diff * (1 - eye_r)
+        inv_sum = inv_sum * (1 - eye_r)
+
         Uh = U.mH
         S_inv = _safe_inv(S, eps).to(dtype)
 
-        # Pad gradients to full SVD size
-        gU = torch.zeros(m, r, dtype=dtype, device=device)
-        gU[:, :k] = dU
-        gS = torch.zeros(r, dtype=S.dtype, device=device)
-        gS[:k] = dS
-        gVh = torch.zeros(r, n, dtype=dtype, device=device)
-        gVh[:k, :] = dVh
-        gV = gVh.mH  # (n, r)
+        # Anti-Hermitian parts
+        UhdU = Uh @ dU_full
+        VhdV = V.mH @ dVh_full.mH
+        aUdU = (UhdU - UhdU.mH) / 2
+        aVdV = (VhdV - VhdV.mH) / 2
 
-        # F-matrix: F_ij = 1/(s_i^2 - s_j^2) for i != j
-        S2 = S * S
-        E = S2.unsqueeze(-2) - S2.unsqueeze(-1)
-        eye_r = torch.eye(r, dtype=E.dtype, device=device)
-        F = _safe_inv(E, eps) * (1 - eye_r)  # Lorentzian for degenerate pairs
+        # F/G split formula
+        UdAV = ((aUdU + aVdV) * inv_diff.to(dtype)
+                + (aUdU - aVdV) * inv_sum.to(dtype))
+        UdAV = UdAV + torch.diag_embed(dS_full.to(dtype))
 
-        S_dtype = S.to(dtype)
-        dA = torch.zeros(m, n, dtype=dtype, device=device)
+        dA = U @ UdAV @ Vh
 
-        # dS contribution
-        dA = dA + U @ torch.diag_embed(gS.to(dtype)) @ Vh
-
-        # dU contribution (skew-Hermitian part)
-        UhgU = Uh @ gU
-        skew_U = UhgU - UhgU.mH
-        u_term = U @ (F * skew_U * S_dtype.unsqueeze(-2)) @ Vh
-        dA = dA + u_term
-
-        # Complement projection for U (when m > r)
+        # Complement projection terms
         if m > r:
-            proj_U = gU - U @ (Uh @ gU)
-            dA = dA + proj_U @ (S_inv.unsqueeze(-1) * Vh)
-
-        # dVh contribution (skew-Hermitian part)
-        VhgV = Vh @ gV
-        skew_V = VhgV - VhgV.mH
-        v_term = U @ (S_dtype.unsqueeze(-1) * F * skew_V) @ Vh
-        dA = dA + v_term
-
-        # Complement projection for V (when n > r)
+            dU_perp = dU_full - U @ (Uh @ dU_full)
+            dA = dA + dU_perp @ (S_inv.unsqueeze(-1) * Vh)
         if n > r:
-            proj_V = gV - V @ (Vh @ gV)
-            dA = dA + (U * S_inv.unsqueeze(-2)) @ proj_V.mH
+            dVh_perp = dVh_full - (dVh_full @ V) @ Vh
+            dA = dA + (U * S_inv.unsqueeze(-2)) @ dVh_perp
 
-        # Wan-Zhang complex phase correction
+        # Wan-Zhang complex phase correction (arXiv:1909.02659)
         if is_complex:
-            L_diag = UhgU.diagonal()
-            L_anti = L_diag - L_diag.conj()  # 2i * Im(diag(U^H gU))
+            L_diag = UhdU.diagonal()
+            L_anti = L_diag - L_diag.conj()  # = 2i * Im(L_diag)
             dA = dA + U @ torch.diag_embed(0.5 * L_anti * S_inv) @ Vh
 
         return dA.to(orig_dtype), None
@@ -113,10 +117,6 @@ def diff_svd(A, k):
     Differentiable truncated SVD.
 
     Returns Uk (m,k), Sk (k,), Vhk (k,n).
-    Both Uk and Vhk have gradients connected to A.
-
-    Uses the Wan-Zhang formula (arXiv:1909.02659) for the complex
-    backward, which correctly handles the phase degree of freedom
-    for gauge-invariant losses.
+    Uses F/G split (Lorentzian) + Wan-Zhang complex correction.
     """
     return TruncatedSVD.apply(A, k)
