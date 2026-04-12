@@ -349,7 +349,7 @@ if __name__ == '__main__':
     parser.add_argument('--n-iters', type=int, default=50)
     parser.add_argument('--rank', type=int, default=8)
     parser.add_argument('--nc', type=int, default=3, help='TSP cities')
-    parser.add_argument('--molecule', type=str, default='H2',
+    parser.add_argument('--molecule', type=str, default='H4',
                         choices=['H2', 'H4', 'LiH'])
     args = parser.parse_args()
 
